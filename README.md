@@ -1,157 +1,137 @@
 # CLARITY
 
-CLARITY is a compact public release of our current treatment-planning codebase for glioma longitudinal modeling and inverse survival evaluation.
+CLARITY is the current public code release for our MRI-conditioned survival modeling and inverse treatment planning pipeline for glioma longitudinal data.
 
-This repo contains two active parts:
 
-- `Predictor/`: MRI-conditioned survival/world-model training
-- `Policy/` + `main.py`: inverse therapy search with guardrails, toxicity heuristics, and trajectory-level risk evaluation
+## Installation
 
-This release is intentionally code-only. It does not include patient data, MRI volumes, pretrained checkpoints, or experiment outputs.
-
-## Repository Layout
-
-```text
-CLARITY/
-├── Predictor/
-│   ├── train.py
-│   ├── dataset/
-│   ├── losses/
-│   ├── models/
-│   └── utils/
-├── Policy/
-├── main.py
-├── run_training.sh
-├── treatment_constraints.json
-├── requirements.txt
-└── .env.example
-```
-
-## What Is Included
-
-- MRI-based survival training entrypoint: `Predictor/train.py`
-- BrainIAC-style MRI vision backbone integration
-- MedGemma text encoder with LoRA fine-tuning
-- time-aware latent prediction + survival supervision
-- inverse survival evaluation in `main.py`
-- single-step and long-horizon trajectory search
-
-## What Is Not Included
-
-- clinical timeline files
-- MRI volumes
-- BrainIAC checkpoints
-- trained Predictor checkpoints
-- external foundation-model repositories cloned locally during development
-- legacy diffusion / pixel-loss code paths
-- analysis, plotting, and dev-only test scripts
-
-## Environment
-
-Recommended:
-
-- Python 3.10
-- CUDA-enabled PyTorch
-- `transformers`, `peft`, `bitsandbytes`
-- `monai`
-- `nibabel`
-
-Install dependencies:
+Use Python 3.10 and install dependencies with:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-For inverse planning, set your OpenAI key:
+For inverse planning with `main.py`, set:
 
 ```bash
 export OPENAI_API_KEY=your_api_key_here
 ```
 
-## External Assets You Must Provide
+## Data
 
-This repository will not run end-to-end unless you supply the following resources locally.
-
-1. Clinical timeline JSON
-2. MRI root directory
-3. BrainIAC checkpoint
-4. Trained Predictor checkpoint
-
-The current code expects paths like:
-
-```text
-Predictor/dataset/MU_Glioma_Post/clinical_latest.json
-datasets/MU-Glioma-Post/
-BrainIAC-main/src/checkpoints/BrainIAC.ckpt
-```
-
-These assets are intentionally excluded from version control.
+The raw public dataset can be obtained from TCIA.
 
 ## Training
 
-Primary training entrypoint:
+The active training entrypoint is:
 
 ```bash
 python Predictor/train.py
 ```
 
-The current training setup:
+This version trains:
 
-- reads pre/post MRI volumes directly
-- uses BrainIAC-style vision encoding
-- uses MedGemma for treatment and clinical text
-- removes the old pixel-loss / diffusion branch
-- trains survival objectives plus contrastive regularization
+- MRI vision backbone
+- MedGemma text encoder
+- time-aware latent transition predictor
+- survival latent predictor
 
-Convenience launcher:
+
+### Example Training Command
+
+```bash
+python Predictor/train.py \
+  --exp_name mri_backbone_survival \
+  --timeline_json ./Predictor/dataset/MU_Glioma_Post/clinical_latest.json \
+  --mri_root ./datasets/MU-Glioma-Post \
+  --vision_checkpoint ./BrainIAC-main/src/checkpoints/BrainIAC.ckpt \
+  --mri_size 96 \
+  --batch_size 4 \
+  --val_batch_size 4 \
+  --num_epochs 40
+```
+
+You can also use:
 
 ```bash
 bash run_training.sh
 ```
 
-Note: `run_training.sh` assumes the external assets above already exist at the expected local paths.
+## Inference
 
-## Inference And Inverse Planning
-
-Main planning entrypoint:
+Example of inverse treatment planning inference:
 
 ```bash
 python main.py
 ```
 
-`main.py` implements:
+`main.py` currently runs through the example block under `if __name__ == "__main__":`.
+Before running it, edit the following fields in `main.py` to match your case:
 
-- LLM-based post-treatment proposal generation
-- guardrail repair and toxicity-aware scoring
-- world-model rollout over imagined disease trajectories
-- discounted cumulative risk scoring
-- entropy-regularized candidate refinement
+- `WORLD_MODEL_PATH`
+- `pre_treatment_latent`
+- patient clinical profile
+- `pre_payload`
+- `between_payload`
 
-It supports both:
+## Inverse Survival Evaluation
 
-- single-step inverse survival evaluation with `planning_horizon=1`
-- long-horizon planning with `planning_horizon>1`
+The core function is:
 
-## Current Public Scope
+```python
+glioma_sequence_exploration(...)
+```
 
-This repository is the first code-focused public snapshot, not a polished benchmark release. The current emphasis is:
+defined in `main.py`.
 
-- trainability
-- inference/planning logic
-- reproducible code structure
+The current inverse pipeline works as follows:
 
-It is not yet packaged as a turnkey public benchmark because dataset preprocessing, checkpoint packaging, and example assets are not distributed here.
+1. Generate candidate post-treatment actions with the LLM policy
+2. Repair candidates using clinical guardrails
+3. Evaluate candidates with the survival/world model
+4. Rank sequences by predicted risk, toxicity, complexity, and uncertainty
+5. Return the best treatment sequence and top-ranked alternatives
 
-## Security Note
+It supports:
 
-- `main.py` reads the OpenAI API key from `OPENAI_API_KEY`
-- no hard-coded API key is kept in this public repo
+- single-step inverse evaluation with `planning_horizon=1`
+- long-horizon inverse planning with `planning_horizon>1`
 
-## Next Cleanup Targets
+Important arguments in `glioma_sequence_exploration(...)`:
 
-If we turn this into a fuller open-source release later, the next steps should be:
+- `pre_treatment_latent`
+- `clinical`
+- `imaging`
+- `pre_payload`
+- `between_payload`
+- `world_model_path`
+- `num_llm_sequences`
+- `num_variants`
+- `top_k`
+- `planning_horizon`
+- `discount_factor`
+- `entropy_temperature`
 
-- add config files for training and inference
-- document checkpoint formats
-- provide a small synthetic example input bundle
-- clean up path assumptions in `run_training.sh` and `main.py`
+## Citation
+
+If you find this repository helpful, please cite:
+
+```bibtex
+@article{ding2025clarity,
+  title={CLARITY: Medical World Model for Guiding Treatment Decisions by Modeling Context-Aware Disease Trajectories in Latent Space},
+  author={Ding, Tianxingjian and Zou, Yuanhao and Chen, Chen and Shah, Mubarak and Tian, Yu},
+  journal={arXiv preprint arXiv:2512.08029},
+  year={2025}
+}
+```
+
+## Acknowledgement
+
+This codebase acknowledges prior and related foundation-model components including:
+
+- MRI-CORE
+- BrainIAC
+
+## License
+
+This repository is released under the MIT License. See `LICENSE`.
