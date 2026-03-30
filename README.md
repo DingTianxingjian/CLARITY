@@ -1,84 +1,157 @@
-# MeWM Public Release
+# CLARITY
 
-This repository contains the public code for the current treatment planning stack built around:
+CLARITY is a compact public release of our current treatment-planning codebase for glioma longitudinal modeling and inverse survival evaluation.
 
-- `Predictor/`: MRI-conditioned survival/world model training and evaluation
-- `Policy/`: treatment representation, guardrails, and toxicity heuristics
-- `main.py`: inverse survival evaluation and trajectory-level therapy search
+This repo contains two active parts:
 
-## Scope
+- `Predictor/`: MRI-conditioned survival/world-model training
+- `Policy/` + `main.py`: inverse therapy search with guardrails, toxicity heuristics, and trajectory-level risk evaluation
 
-This public release is intentionally minimal. It excludes:
+This release is intentionally code-only. It does not include patient data, MRI volumes, pretrained checkpoints, or experiment outputs.
 
-- patient data and derived clinical timelines
-- MRI volumes
-- model checkpoints
-- experiment outputs and cached reports
-- large third-party foundation model repositories vendored locally during development
-- legacy diffusion / pixel-loss code paths that are no longer part of the current training setup
+## Repository Layout
 
-## Current Training Path
-
-The active training entrypoint is:
-
-- `Predictor/train.py`
-
-The current setup uses:
-
-- MRI volumes as direct input
-- BrainIAC-style MRI vision backbone
-- MedGemma text encoder for treatment/clinical text
-- survival supervision without pixel reconstruction or diffusion loss
-
-## Inverse Planning Path
-
-The main inference/planning entrypoint is:
-
-- `main.py`
-
-It now supports:
-
-- single-step inverse survival evaluation with `planning_horizon=1`
-- long-horizon trajectory rollout with discounted cumulative risk
-- entropy-regularized candidate search with iterative LLM feedback
-
-## External Assets Required
-
-This repo will not run end-to-end without external assets. You need to provide:
-
-1. Clinical timeline JSON
-2. MRI data directory
-3. BrainIAC checkpoint
-4. Trained Predictor checkpoint
-5. OpenAI API key via environment variable
-
-Example environment variable:
-
-```bash
-export OPENAI_API_KEY=...
+```text
+CLARITY/
+├── Predictor/
+│   ├── train.py
+│   ├── dataset/
+│   ├── losses/
+│   ├── models/
+│   └── utils/
+├── Policy/
+├── main.py
+├── run_training.sh
+├── treatment_constraints.json
+├── requirements.txt
+└── .env.example
 ```
 
-## Suggested Public Repo Layout
+## What Is Included
 
-Kept in version control:
+- MRI-based survival training entrypoint: `Predictor/train.py`
+- BrainIAC-style MRI vision backbone integration
+- MedGemma text encoder with LoRA fine-tuning
+- time-aware latent prediction + survival supervision
+- inverse survival evaluation in `main.py`
+- single-step and long-horizon trajectory search
 
-- `Predictor/`
-- `Policy/`
-- `main.py`
-- `run_training.sh`
-- `requirements.txt`
-- `treatment_constraints.json`
+## What Is Not Included
 
-Ignored by default:
+- clinical timeline files
+- MRI volumes
+- BrainIAC checkpoints
+- trained Predictor checkpoints
+- external foundation-model repositories cloned locally during development
+- legacy diffusion / pixel-loss code paths
+- analysis, plotting, and dev-only test scripts
 
-- `datasets/`
-- `checkpoints/`
-- `output/`
-- `BrainIAC-main/`
-- `mri_foundation/`
-- local reports, caches, and generated figures
+## Environment
 
-## Notes
+Recommended:
 
-- `main.py` no longer contains a hard-coded API key.
-- If you want to publish a more polished open-source release, the next step should be splitting dev-only scripts from the stable API surface and adding a small example config directory.
+- Python 3.10
+- CUDA-enabled PyTorch
+- `transformers`, `peft`, `bitsandbytes`
+- `monai`
+- `nibabel`
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+For inverse planning, set your OpenAI key:
+
+```bash
+export OPENAI_API_KEY=your_api_key_here
+```
+
+## External Assets You Must Provide
+
+This repository will not run end-to-end unless you supply the following resources locally.
+
+1. Clinical timeline JSON
+2. MRI root directory
+3. BrainIAC checkpoint
+4. Trained Predictor checkpoint
+
+The current code expects paths like:
+
+```text
+Predictor/dataset/MU_Glioma_Post/clinical_latest.json
+datasets/MU-Glioma-Post/
+BrainIAC-main/src/checkpoints/BrainIAC.ckpt
+```
+
+These assets are intentionally excluded from version control.
+
+## Training
+
+Primary training entrypoint:
+
+```bash
+python Predictor/train.py
+```
+
+The current training setup:
+
+- reads pre/post MRI volumes directly
+- uses BrainIAC-style vision encoding
+- uses MedGemma for treatment and clinical text
+- removes the old pixel-loss / diffusion branch
+- trains survival objectives plus contrastive regularization
+
+Convenience launcher:
+
+```bash
+bash run_training.sh
+```
+
+Note: `run_training.sh` assumes the external assets above already exist at the expected local paths.
+
+## Inference And Inverse Planning
+
+Main planning entrypoint:
+
+```bash
+python main.py
+```
+
+`main.py` implements:
+
+- LLM-based post-treatment proposal generation
+- guardrail repair and toxicity-aware scoring
+- world-model rollout over imagined disease trajectories
+- discounted cumulative risk scoring
+- entropy-regularized candidate refinement
+
+It supports both:
+
+- single-step inverse survival evaluation with `planning_horizon=1`
+- long-horizon planning with `planning_horizon>1`
+
+## Current Public Scope
+
+This repository is the first code-focused public snapshot, not a polished benchmark release. The current emphasis is:
+
+- trainability
+- inference/planning logic
+- reproducible code structure
+
+It is not yet packaged as a turnkey public benchmark because dataset preprocessing, checkpoint packaging, and example assets are not distributed here.
+
+## Security Note
+
+- `main.py` reads the OpenAI API key from `OPENAI_API_KEY`
+- no hard-coded API key is kept in this public repo
+
+## Next Cleanup Targets
+
+If we turn this into a fuller open-source release later, the next steps should be:
+
+- add config files for training and inference
+- document checkpoint formats
+- provide a small synthetic example input bundle
+- clean up path assumptions in `run_training.sh` and `main.py`
