@@ -1,0 +1,84 @@
+{
+  "radiation": {
+    "dose_range": [
+      40.0,
+      70.0
+    ],
+    "fractions_range": [
+      20,
+      35
+    ],
+    "common_doses": [
+      54.0,
+      59.4,
+      60.0
+    ]
+  },
+  "chemo": {
+    "common_agents": [
+      "Temozolomide",
+      "Lomustine"
+    ],
+    "cycle_length_range": [
+      21,
+      56
+    ],
+    "num_cycles_range": [
+      1,
+      12
+    ]
+  },
+  "immono": {
+    "common_agents": [
+      "Avastin",
+      "Avastin and Retifanlimab",
+      "Avastin w/ Temodar",
+      "Ivosenib"
+    ],
+    "cycle_length_range": [
+      14,
+      42
+    ],
+    "num_cycles_range": [
+      1,
+      12
+    ]
+  },
+  "additional_1": {
+    "common_agents": [
+      "Temozolomide",
+      "PCV"
+    ],
+    "cycle_length_range": [
+      21,
+      56
+    ],
+    "num_cycles_range": [
+      1,
+      12
+    ]
+  },
+  "additional_2": {
+    "common_agents": [
+      "Lomustine",
+      "Avastin",
+      "Temozolomide w/ Avastin",
+      "Keytruda",
+      "PCV",
+      "Temozolomide",
+      "Carboplatin",
+      "Irinotecan"
+    ],
+    "cycle_length_range": [
+      21,
+      56
+    ],
+    "num_cycles_range": [
+      1,
+      12
+    ]
+  },
+  "other_therapy": {
+    "common_types": []
+  }
+}

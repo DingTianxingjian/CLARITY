@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Local editor / OS
+.vscode/
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Data and metadata
+datasets/
+Predictor/dataset/MU_Glioma_Post/
+*.xlsx
+*.csv
+*.npz
+
+# Checkpoints and experiment outputs
+checkpoints/
+output/
+test_results_consecutive/
+Predictor/predicted_km_curves/
+Predictor/survival_report/
+Predictor/time_evolution_demo/
+Predictor/clinical_timeline_report.json
+
+# External foundation model repos / local vendored code
+BrainIAC-main/
+Encoder/
+Survival/
+Synthesis/
+mri_foundation/
+dataset_3d/
+glioma_data/
+
+# One-off analysis / notebooks / generated assets
+quickstart.ipynb
+example.py
+dataset.py
+analyze_survival_data.py
+create_csv.py
+export_t1c_slices.py
+visualize_t1c_slices.py
+test_brainiac_flops.py
+test_brainiac_quad_flops.py
+test_consecutive_pairs.py
+test_data_driven_policy.py
+test_vae_loading.py
+
+# Legacy diffusion / VAE path kept locally but not published
+Predictor/train_t1_conditional_diffusion.py
+Predictor/train_survival.py
+Predictor/infer_t1_conditional_diffusion.py
+Predictor/finetune_t1_vae.py
+Predictor/eval_t1_vae_recon.py
+Predictor/eval_t1_generation_metrics.py
+Predictor/eval_slice_fid.py
+Predictor/eval_t1_3d_fid.py
+Predictor/models/conditional_vae_module.py
+Predictor/PIXEL_LOSS_README.md
+
+# Extra analysis / dev-only scripts excluded from the first public release
+Predictor/analyse_survival.py
+Predictor/check_clinical_timeline.py
+Predictor/plot_cindex.py
+Predictor/plot_predicted_km.py
+Predictor/plot_time_evolution.py
+Predictor/test_brainiac_condition_stats.py
+Predictor/test_flops.py
+Predictor/validate_tumor_evolution.py
+Predictor/dataset/context_vectorizer.py
+Predictor/dataset/extract_clinicial.py
+Predictor/models/latent_predictor.py
+Predictor/models/survival_module.py
+Predictor/models/text_encoder.py
+Predictor/utils/data_preprocessing.py
