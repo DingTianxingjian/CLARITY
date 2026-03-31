@@ -8,6 +8,26 @@ from scipy.stats import rankdata
 from collections import deque
 
 
+def one_year_survival_targets_torch(survival_time, event_indicators, horizon_days: float = 365.0):
+    """
+    Build 1-year survival labels with the repo's current convention.
+
+    Label: survived beyond horizon_days.
+    Mask: include samples that either survive beyond horizon_days or are censored.
+    """
+    labels = (survival_time > horizon_days).float()
+    mask = (survival_time > horizon_days) | ((survival_time <= horizon_days) & (event_indicators == 1))
+    return labels, mask.float()
+
+
+def one_year_survival_targets_numpy(survival_time, event_indicators, horizon_days: float = 365.0):
+    survival_time = np.asarray(survival_time, dtype=float)
+    event_indicators = np.asarray(event_indicators)
+    labels = (survival_time > horizon_days).astype(float)
+    mask = (survival_time > horizon_days) | ((survival_time <= horizon_days) & (event_indicators == 1))
+    return labels, mask
+
+
 def concordance_index(risk_scores, survival_times, event_indicators):
     """
     计算C-index (Concordance Index)

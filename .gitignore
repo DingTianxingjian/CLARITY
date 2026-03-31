@@ -77,6 +77,5 @@ Predictor/validate_tumor_evolution.py
 Predictor/dataset/context_vectorizer.py
 Predictor/dataset/extract_clinicial.py
 Predictor/models/latent_predictor.py
-Predictor/models/survival_module.py
 Predictor/models/text_encoder.py
 Predictor/utils/data_preprocessing.py

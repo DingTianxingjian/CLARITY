@@ -88,17 +88,27 @@ class GliomaAllPairsTextDataset(Dataset):
                     post = enriched[j]
                     if self.feat is not None and not self.feat.has(post["id"]):
                         continue
+                    pre_day = pre["mri_day"]
+                    post_day = post["mri_day"]
+                    if post_day <= pre_day:
+                        continue  # 跳过时间顺序异常的样本对
+                    survival_time = float(post["survival"].get("survival_from_tp_days", -1.0))
+                    event_indicator = int(post["survival"].get("event_indicator", 0))
+                    if survival_time < 0:
+                        continue  # 跳过没有生存标签的样本
+                    # 临时止血：去掉删失且生存时间为0/非正的样本，避免污染 survival supervision
+                    if event_indicator == 0 and survival_time <= 0:
+                        continue
                     item = {
                         "pid": pid, "i": i, "j": j,
                         "pre_id": pre["id"], "post_id": post["id"],
                         "pre_tp": pre["tp"], "post_tp": post["tp"],
                         "pre_actions": pre["actions"],
                         "post_actions": post["actions"],
-                        "pre_mri_day": pre["mri_day"],
-                        "post_mri_day": post["mri_day"],
-                        # 修正：从 post 时间点的 survival 字典中提取生存信息
-                        "survival_time": float(post["survival"].get("survival_from_tp_days", -1.0)),
-                        "event_indicator": int(post["survival"].get("event_indicator", 0)),
+                        "pre_mri_day": pre_day,
+                        "post_mri_day": post_day,
+                        "survival_time": survival_time,
+                        "event_indicator": event_indicator,
                         "context_static": pre["context_static"]
                     }
                     if include_between:

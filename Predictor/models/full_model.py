@@ -9,6 +9,8 @@ from transformers import AutoTokenizer, AutoModel
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import math
+from models.survival_module import SurvivalModule
+from utils.metrics import one_year_survival_targets_torch
 
 try:
     from monai.networks.nets import ViT as MonaiViT
@@ -436,133 +438,96 @@ class TaskSpecificProjection(nn.Module):
         return self.projection(x)
 
 
-class TimeAwareTransformerLatentPredictor(nn.Module):
+class SinusoidalPositionalEncoding(nn.Module):
+    """Standard sinusoidal positional encoding for Transformer sequences."""
+    def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(1, max_len, d_model)
+        position = torch.arange(max_len).unsqueeze(1).float()
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
+
+
+class LatentPredictor(nn.Module):
     """
-    时间感知的潜在预测器
-    核心改进：显式建模时间对特征演化的影响
+    Drug- and time-conditioned latent predictor.
+    Drug text embedding and time encoding are each prepended as condition tokens;
+    modality tokens follow.  A Transformer encoder models cross-token interactions,
+    and the output is added as a residual to pre_latent.
     """
     def __init__(
         self,
-        input_dim=767,
-        condition_dim=1536,
-        time_dim=128,
-        num_modalities=4,
-        hidden_dim=512,
-        num_layers=4,
-        num_heads=8,
-        dropout=0.1,
-        time_encoding_type='fourier'  # 'positional', 'learnable', 'fourier'
+        latent_dim: int = 768,
+        drug_dim: int = 768,
+        time_dim: int = 128,
+        hidden_dim: int = 256,
+        num_layers: int = 4,
+        num_heads: int = 4,
+        ffn_dim: int = 1024,
+        dropout: float = 0.1,
     ):
         super().__init__()
-        self.input_dim = input_dim
-        self.num_modalities = num_modalities
+        self.latent_proj = nn.Linear(latent_dim, hidden_dim)
+        self.drug_proj = nn.Linear(drug_dim, hidden_dim)
+        # Fourier time encoding: time_delta → [B, time_dim]
         self.time_dim = time_dim
-        
-        # 时间编码器（三选一）
-        if time_encoding_type == 'positional':
-            self.time_encoder = PositionalTimeEncoding(d_model=time_dim)
-        elif time_encoding_type == 'learnable':
-            self.time_encoder = LearnableTimeEmbedding(d_model=time_dim)
-        elif time_encoding_type == 'fourier':
-            self.time_encoder = FourierTimeEmbedding(d_model=time_dim)
-        else:
-            raise ValueError(f"Unknown time encoding type: {time_encoding_type}")
-        
-        # 条件向量投影（包含治疗 + 临床背景 + 时间）
-        total_condition_dim = condition_dim + time_dim
-        self.condition_proj = nn.Linear(total_condition_dim, hidden_dim)
-        
-        # 输入特征投影
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-        
-        # Transformer编码器
+        self.time_proj = nn.Linear(time_dim, hidden_dim)
+        self.pos_encoder = SinusoidalPositionalEncoding(hidden_dim, max_len=5000, dropout=dropout)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
+            dim_feedforward=ffn_dim,
             dropout=dropout,
-            batch_first=True
+            batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # 输出投影
-        self.output_proj = nn.Linear(hidden_dim, input_dim)
-        
-        # 残差连接权重（时间相关）
-        self.residual_gate = nn.Sequential(
-            nn.Linear(time_dim, num_modalities),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, pre_latent, condition, time_delta):
+        self.output_proj = nn.Linear(hidden_dim, latent_dim)
+
+    def _encode_time(self, time_delta: torch.Tensor) -> torch.Tensor:
+        """Fourier time encoding: [B] → [B, time_dim]"""
+        t = time_delta.float().unsqueeze(1)  # [B, 1]
+        d = self.time_dim
+        freqs = torch.exp(
+            torch.arange(0, d, 2, device=t.device, dtype=t.dtype) *
+            (-math.log(10000.0) / d)
+        )  # [d/2]
+        args = t * freqs.unsqueeze(0)  # [B, d/2]
+        enc = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # [B, d]
+        return enc
+
+    def forward(
+        self,
+        pre_latent: torch.Tensor,
+        drug_emb: torch.Tensor,
+        time_delta: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Args:
-            pre_latent: [B, 4, 767] - 治疗前特征
-            condition: [B, 1536] - 治疗+临床背景
-            time_delta: [B] - 时间差（天）
-        
+            pre_latent:  [B, M, latent_dim]
+            drug_emb:    [B, drug_dim]
+            time_delta:  [B]  (days between pre and post scan)
         Returns:
-            predicted_latent: [B, 4, 767] - 预测的治疗后特征
+            predicted_latent: [B, M, latent_dim]
         """
-        B = pre_latent.shape[0]
-        
-        # 1. 编码时间差
-        time_encoding = self.time_encoder(time_delta)  # [B, time_dim]
-        
-        # 2. 融合条件向量（治疗 + 临床 + 时间）
-        full_condition = torch.cat([condition, time_encoding], dim=1)  # [B, 1536+128]
-        cond_tokens = self.condition_proj(full_condition).unsqueeze(1)  # [B, 1, hidden_dim]
-        
-        # 3. 投影输入特征
-        latent_tokens = self.input_proj(pre_latent)  # [B, 4, hidden_dim]
-        
-        # 4. 拼接条件和特征
-        tokens = torch.cat([cond_tokens, latent_tokens], dim=1)  # [B, 5, hidden_dim]
-        
-        # 5. Transformer编码
-        encoded = self.transformer(tokens)  # [B, 5, hidden_dim]
-        
-        # 6. 提取特征部分
-        feature_encoded = encoded[:, 1:, :]  # [B, 4, hidden_dim]
-        
-        # 7. 投影回原始维度
-        delta_features = self.output_proj(feature_encoded)  # [B, 4, 767]
-        
-        # 8. 时间相关的残差连接（重要！）
-        # 时间越长，变化越大；时间越短，保留更多原始特征
-        residual_weight = self.residual_gate(time_encoding).unsqueeze(-1)  # [B, 4, 1]
-        
-        # predicted = pre + Δ * f(time)
-        predicted_latent = pre_latent + delta_features * residual_weight
-        
-        return predicted_latent
-
-
-class SurvivalModule(nn.Module):
-    """生存分析模块（简化版）"""
-    def __init__(self, latent_dim=767, num_modalities=4, hidden_dim=128, dropout=0.1):
-        super().__init__()
-        
-        input_dim = latent_dim * num_modalities * 2
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        
-        self.risk_head = nn.Linear(hidden_dim, 1)
-        self.survival_head = nn.Linear(hidden_dim, 1)
-    
-    def forward(self, pre_latent, post_latent):
-        combined = torch.cat([pre_latent.flatten(1), post_latent.flatten(1)], dim=1)
-        features = self.mlp(combined)
-        risk_score = self.risk_head(features)
-        survival_prob = self.survival_head(features)
-        return risk_score, survival_prob
+        latent_tokens = self.latent_proj(pre_latent)              # [B, M, H]
+        drug_token = self.drug_proj(drug_emb).unsqueeze(1)        # [B, 1, H]
+        time_enc = self._encode_time(time_delta)                  # [B, time_dim]
+        time_token = self.time_proj(time_enc).unsqueeze(1)        # [B, 1, H]
+        # condition tokens first, then modality tokens
+        tokens = torch.cat([drug_token, time_token, latent_tokens], dim=1)  # [B, M+2, H]
+        tokens = self.pos_encoder(tokens)
+        encoded = self.transformer(tokens)                         # [B, M+2, H]
+        delta = self.output_proj(encoded[:, 2:, :])               # [B, M, latent_dim]
+        return pre_latent + delta
 
 
 class TimeAwareGliomaSurvivalPredictor(nn.Module):
@@ -580,40 +545,40 @@ class TimeAwareGliomaSurvivalPredictor(nn.Module):
         text_encoder_name: str = "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext",
         freeze_text_encoder: bool = True,
         text_output_dim: int = 768,
-        
+
         # 时间编码参数
         time_dim: int = 128,
-        time_encoding_type: str = 'fourier',  # 'positional', 'learnable', 'fourier'
-        
+        time_encoding_type: str = 'fourier',  # kept for compatibility, fourier used internally
+
         # 潜在预测器参数
         latent_dim: int = 767,
         num_modalities: int = 4,
         predictor_hidden_dim: int = 256,
-        predictor_num_layers: int = 2,
+        predictor_num_layers: int = 4,
         predictor_num_heads: int = 4,
-        
+
         # 生存模块参数
-        survival_hidden_dim: int = 64,
-        
+        survival_hidden_dim: int = 128,
+
         # 损失权重
         lambda_l1: float = 1.0,
         lambda_cox: float = 0.5,
         lambda_bce: float = 0.5,
         lora_r: int = 8,
         lora_alpha: int = 16,
-        dropout: float = 0.3
+        dropout: float = 0.3,
     ):
         super().__init__()
-        
+
         self.latent_dim = latent_dim
         self.num_modalities = num_modalities
-        
+
         # 损失权重
         self.register_buffer('lambda_l1', torch.tensor(lambda_l1))
         self.register_buffer('lambda_cox', torch.tensor(lambda_cox))
         self.register_buffer('lambda_bce', torch.tensor(lambda_bce))
-        
-        # 1. 共享文本编码器
+
+        # 1. 共享文本编码器 (MedGemma)
         self.shared_text_encoder = SharedTextEncoder(
             model_name=text_encoder_name,
             lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=0.1,
@@ -625,93 +590,60 @@ class TimeAwareGliomaSurvivalPredictor(nn.Module):
             self.shared_text_encoder.disable_gradient_checkpointing()
             for param in self.shared_text_encoder.parameters():
                 param.requires_grad = False
-        
-        # 2. 任务特定投影层
-        self.drug_projection = TaskSpecificProjection(
-            input_dim=text_output_dim,
-            output_dim=text_output_dim,
-            dropout=dropout
-        )
-        
-        self.context_projection = TaskSpecificProjection(
-            input_dim=text_output_dim,
-            output_dim=text_output_dim,
-            dropout=dropout
-        )
-        
-        # 3. 时间感知的潜在预测器
-        condition_dim = text_output_dim * 2
-        self.latent_predictor = TimeAwareTransformerLatentPredictor(
-            input_dim=latent_dim,
-            condition_dim=condition_dim,
+
+        # 2. Drug+clinical- and time-conditioned latent predictor (Transformer with residual)
+        # drug_emb and clinical_emb are concatenated → condition_dim = 2 * text_output_dim
+        self.latent_predictor = LatentPredictor(
+            latent_dim=latent_dim,
+            drug_dim=text_output_dim * 2,  # drug || clinical
             time_dim=time_dim,
-            num_modalities=num_modalities,
             hidden_dim=predictor_hidden_dim,
             num_layers=predictor_num_layers,
             num_heads=predictor_num_heads,
+            ffn_dim=predictor_hidden_dim * 4,
             dropout=dropout,
-            time_encoding_type=time_encoding_type
         )
-        
-        # 4. 生存模块
-        survival_input_dim = latent_dim + text_output_dim
+
+        # 3. Two-way attention survival module
         self.survival_module = SurvivalModule(
-            latent_dim=survival_input_dim,
+            latent_dim=latent_dim,
             num_modalities=num_modalities,
             hidden_dim=survival_hidden_dim,
-            dropout=dropout
+            num_twoway_layers=2,
+            num_heads=predictor_num_heads,
+            dropout=dropout,
         )
     
     def forward(self, pre_latent, drugs_text, time_delta, clinical_text=None):
         """
         Args:
-            pre_latent: [B, 4, 767]
-            drugs_text: List[str]
-            time_delta: [B] - 时间差（天），关键输入！
-            clinical_text: List[str] (optional)
-        
+            pre_latent:    [B, M, latent_dim]
+            drugs_text:    List[str]
+            time_delta:    [B]  days between pre and post scan
+            clinical_text: List[str] (optional; zeros used when absent)
         Returns:
-            predicted_latent: [B, 4, 767]
-            risk_score: [B, 1]
-            survival_prob: [B, 1]
+            predicted_latent: [B, M, latent_dim]
+            risk_score:       [B, 1]
+            survival_logit:   [B, 1]
         """
-        # 1. 共享编码器处理文本
-        drug_base_emb = self.shared_text_encoder(drugs_text)
-        
+        # 1. Encode drug text and clinical context through MedGemma
+        drug_emb = self.shared_text_encoder(drugs_text)           # [B, D]
         if clinical_text and any(clinical_text):
-            context_base_emb = self.shared_text_encoder(clinical_text)
+            clinical_emb = self.shared_text_encoder(clinical_text)  # [B, D]
         else:
-            context_base_emb = torch.zeros_like(drug_base_emb)
-        
-        # 2. 任务特定投影
-        drug_embedding = self.drug_projection(drug_base_emb)
-        context_embedding = self.context_projection(context_base_emb)
-        
-        # 3. 融合条件
-        condition_embedding = torch.cat([drug_embedding, context_embedding], dim=1)
-        
-        # 4. 时间感知的潜在预测（关键：传入time_delta）
-        predicted_latent = self.latent_predictor(
-            pre_latent, 
-            condition_embedding, 
-            time_delta  # ✅ 正确使用时间差
-        )
-        
-        # 5. 注入临床背景到生存模块
-        context_expanded = context_embedding.unsqueeze(1).expand(-1, self.num_modalities, -1)
-        pre_latent_survival = torch.cat([pre_latent, context_expanded], dim=-1)
-        predicted_latent_survival = torch.cat([predicted_latent, context_expanded], dim=-1)
-        
-        # 6. 生存分析
-        risk_score, survival_prob = self.survival_module(
-            pre_latent_survival, predicted_latent_survival
-        )
-        
-        return predicted_latent, risk_score, survival_prob
+            clinical_emb = torch.zeros_like(drug_emb)
+        condition_emb = torch.cat([drug_emb, clinical_emb], dim=-1)  # [B, 2D]
+
+        # 2. Predict post-latent conditioned on drug, clinical context, and time
+        predicted_latent = self.latent_predictor(pre_latent, condition_emb, time_delta)
+
+        # 3. Survival prediction via two-way attention on (pre, predicted_post)
+        risk_score, survival_logit = self.survival_module(pre_latent, predicted_latent)
+
+        return predicted_latent, risk_score, survival_logit
     
-    def compute_loss(self, pred_latent, risk_score, survival_prob,
+    def compute_loss(self, pred_latent, risk_score, survival_logit,
                      post_latent, survival_time, event_indicator):
-        """计算损失（与之前相同）"""
         # 1. L1重建损失
         l1_loss = F.l1_loss(pred_latent, post_latent)
         
@@ -721,14 +653,20 @@ class TimeAwareGliomaSurvivalPredictor(nn.Module):
             cox_criterion = NLLDeepSurvLoss()
             cox_loss = cox_criterion(risk_score, survival_time, event_indicator)
         except ImportError:
-            # Fallback: 简单排序损失
             cox_loss = self._simple_cox_loss(risk_score, survival_time, event_indicator)
         
-        # 3. 5年生存BCE
-        five_year_label = ((survival_time > 365) & (event_indicator == 0)).float()
-        bce_loss = F.binary_cross_entropy_with_logits(
-            survival_prob.squeeze(-1), five_year_label
+        # 3. 1-year survival BCE (exclude censored-before-1-year: uncertain label)
+        one_year_label, one_year_mask = one_year_survival_targets_torch(
+            survival_time, event_indicator
         )
+        one_year_mask = one_year_mask.bool()
+        if one_year_mask.any():
+            bce_loss = F.binary_cross_entropy_with_logits(
+                survival_logit.squeeze(-1)[one_year_mask],
+                one_year_label[one_year_mask],
+            )
+        else:
+            bce_loss = risk_score.new_tensor(0.0)
         
         # 4. 加权组合
         total_loss = (
@@ -747,12 +685,6 @@ class TimeAwareGliomaSurvivalPredictor(nn.Module):
         return total_loss, loss_dict
     
     def _simple_cox_loss(self, risk_score, survival_time, event_indicator):
-        """
-        Efron ties 版 Cox 负对数部分似然损失
-        risk_score: [B] 模型输出的 log-risk（值越大风险越高）
-        survival_time: [B] 生存时间
-        event_indicator: [B] 事件标记 (1=死亡, 0=删失)
-        """
         lr = risk_score.view(-1)
         t = survival_time.view(-1)
         e = event_indicator.view(-1)
@@ -798,28 +730,20 @@ class TimeAwareGliomaSurvivalPredictor(nn.Module):
         """统计参数量"""
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
         encoder_params = sum(p.numel() for p in self.shared_text_encoder.parameters())
-        projection_params = sum(p.numel() for p in self.drug_projection.parameters()) + \
-                          sum(p.numel() for p in self.context_projection.parameters())
         predictor_params = sum(p.numel() for p in self.latent_predictor.parameters())
         survival_params = sum(p.numel() for p in self.survival_module.parameters())
-        
         return {
             'total': total,
             'trainable': trainable,
             'encoder': encoder_params,
-            'projections': projection_params,
             'predictor': predictor_params,
-            'survival': survival_params
+            'survival': survival_params,
         }
 
 
 class MRITimeAwareSurvivalPredictor(TimeAwareGliomaSurvivalPredictor):
-    """
-    Time-aware survival predictor that extracts MRI features online using a
-    BrainIAC-style vision backbone instead of precomputed CSV latents.
-    """
+
 
     def __init__(
         self,

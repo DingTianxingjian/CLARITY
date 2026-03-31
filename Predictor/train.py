@@ -1,9 +1,4 @@
-"""
-Train the time-aware glioma survival model directly from MRI volumes.
-
-This entrypoint removes the old pixel-loss / diffusion branch and instead uses
-an MRI foundation vision backbone to extract pre/post MRI features online.
-"""
+"""Train the latent-space TimeAwareGliomaSurvivalPredictor from features_output.csv."""
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -21,10 +16,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset.dataset_glioma_all_pairs_text import Config
-from dataset.dataset_with_mri import GliomaDatasetWithMRI
-from models.full_model import MRITimeAwareSurvivalPredictor
-from utils.metrics import concordance_index, compute_auc
+from dataset.dataset_glioma_all_pairs_text import Config, GliomaAllPairsTextDataset
+from models.full_model import TimeAwareGliomaSurvivalPredictor
+from utils.metrics import (
+    concordance_index,
+    compute_auc,
+    one_year_survival_targets_torch,
+)
 
 
 TEXT_ENCODER_NAME = "google/medgemma-4b-it"
@@ -75,22 +73,16 @@ class Trainer:
         cosine_sim = F.cosine_similarity(z_anchor, z_negative)
         return F.relu(cosine_sim - margin).mean()
 
-    @staticmethod
-    def _one_year_labels(survival_time, event_indicator):
-        return ((survival_time > 365) & (event_indicator == 0)).float()
-
     def _shared_step(self, batch, compute_contrastive: bool):
-        pre_mri = batch["pre_mri"].to(self.device, non_blocking=True)
-        post_mri = batch["post_mri"].to(self.device, non_blocking=True)
+        pre_latent = batch["pre_latent"].to(self.device, non_blocking=True)
+        post_latent = batch["post_latent"].to(self.device, non_blocking=True)
         survival_time = batch["survival_time"].to(self.device, non_blocking=True)
         event_indicator = batch["event_indicator"].to(self.device, non_blocking=True)
         time_delta = batch["time_delta"].to(self.device, non_blocking=True)
         drugs_text = batch["drugs_text"]
         clinical_text = batch["clinical_text"]
 
-        pre_latent = self.model.encode_mri(pre_mri)
-        post_latent = self.model.encode_mri(post_mri).detach()
-        pred_latent, risk_score, survival_prob = self.model.predict_from_features(
+        pred_latent, risk_score, survival_logit = self.model(
             pre_latent,
             drugs_text,
             time_delta,
@@ -100,7 +92,7 @@ class Trainer:
         contrastive_loss = torch.zeros((), device=self.device)
         if compute_contrastive:
             negative_drugs_text = drugs_text[1:] + drugs_text[:1]
-            pred_negative, _, _ = self.model.predict_from_features(
+            pred_negative, _, _ = self.model(
                 pre_latent,
                 negative_drugs_text,
                 time_delta,
@@ -111,7 +103,7 @@ class Trainer:
         main_loss, loss_dict = self.model.compute_loss(
             pred_latent,
             risk_score,
-            survival_prob,
+            survival_logit,
             post_latent,
             survival_time,
             event_indicator,
@@ -125,7 +117,7 @@ class Trainer:
             "main_loss": main_loss,
             "loss_dict": loss_dict,
             "risk_score": risk_score,
-            "survival_prob": survival_prob,
+            "survival_logit": survival_logit,
             "survival_time": survival_time,
             "event_indicator": event_indicator,
             "time_delta": time_delta,
@@ -142,7 +134,7 @@ class Trainer:
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [Train]")
         for batch_idx, batch in enumerate(pbar):
-            outputs = self._shared_step(batch, compute_contrastive=True)
+            outputs = self._shared_step(batch, compute_contrastive=False)
 
             self.optimizer.zero_grad(set_to_none=True)
             outputs["total_loss"].backward()
@@ -156,12 +148,15 @@ class Trainer:
             all_risks.append(outputs["risk_score"].detach().cpu())
             all_survival_times.append(outputs["survival_time"].detach().cpu())
             all_events.append(outputs["event_indicator"].detach().cpu())
-            all_survival_probs.append(torch.sigmoid(outputs["survival_prob"]).detach().cpu())
-            all_one_year_labels.append(
-                self._one_year_labels(
-                    outputs["survival_time"], outputs["event_indicator"]
-                ).detach().cpu()
+            one_year_labels, one_year_mask = one_year_survival_targets_torch(
+                outputs["survival_time"], outputs["event_indicator"]
             )
+            one_year_mask = one_year_mask.bool()
+            if one_year_mask.any():
+                all_survival_probs.append(
+                    torch.sigmoid(outputs["survival_logit"]).detach().cpu()[one_year_mask.cpu()]
+                )
+                all_one_year_labels.append(one_year_labels.detach().cpu()[one_year_mask.cpu()])
 
             if batch_idx % self.log_interval == 0:
                 pbar.set_postfix(
@@ -169,28 +164,7 @@ class Trainer:
                     main=f"{outputs['main_loss'].item():.4f}",
                     contra=f"{outputs['loss_dict']['contrastive']:.4f}",
                 )
-            if batch_idx == 0:
-                print(f"\n[Epoch {epoch} - First batch diagnostics]")
-                print(
-                    f"  Loss weights: l1={self.model.lambda_l1.item():.3f}, "
-                    f"cox={self.model.lambda_cox.item():.3f}, "
-                    f"bce={self.model.lambda_bce.item():.3f}, "
-                    f"contrastive={self.contrastive_weight:.3f}"
-                )
-                print(
-                    f"  Raw losses: l1={outputs['loss_dict']['l1']:.4f}, "
-                    f"cox={outputs['loss_dict']['cox']:.4f}, "
-                    f"bce={outputs['loss_dict']['bce']:.4f}, "
-                    f"contrastive={outputs['loss_dict']['contrastive']:.4f}"
-                )
-                print(
-                    f"  Main loss: {outputs['main_loss'].item():.4f}, "
-                    f"Total loss: {outputs['loss_dict']['total']:.4f}"
-                )
-                print(
-                    f"  Time delta range: "
-                    f"[{outputs['time_delta'].min():.1f}, {outputs['time_delta'].max():.1f}] days"
-                )
+           
 
         avg_losses = {k: float(np.mean(v)) for k, v in epoch_losses.items()}
         c_index, auc = self._compute_epoch_metrics(
@@ -200,6 +174,21 @@ class Trainer:
             all_survival_probs,
             all_one_year_labels,
         )
+
+        # --- 诊断：梯度范数 + risk score 分布 ---
+        surv_grad_norm = 0.0
+        for p in self.model.survival_module.parameters():
+            if p.grad is not None:
+                surv_grad_norm += p.grad.norm().item() ** 2
+        surv_grad_norm = surv_grad_norm ** 0.5
+        _risks = torch.cat(all_risks).squeeze().numpy()
+        _surv  = torch.cat(all_survival_times).numpy()
+        _corr  = float(np.corrcoef(_risks, _surv)[0, 1]) if _risks.std() > 1e-6 else float('nan')
+        print(
+            f"  [diag-train] risk: std={_risks.std():.4f}  corr(risk,surv)={_corr:.3f}  "
+            f"survival_module grad_norm={surv_grad_norm:.4f}"
+        )
+
         return avg_losses, c_index, auc
 
     @torch.no_grad()
@@ -212,21 +201,89 @@ class Trainer:
         all_survival_probs = []
         all_one_year_labels = []
 
+        # --- One-shot forward-hook diagnostics (runs on first val batch only) ---
+        _debug = {}
+        def _store(name, tensor):
+            tf = tensor.detach().float().reshape(tensor.shape[0], -1)  # [B, *]
+            _debug[name] = (tf.std(dim=0).mean().item(),   # cross-sample diversity
+                            tf.std(dim=1).mean().item(),   # within-sample spread
+                            tf.mean().item())
+        def _make_hook(name):
+            def _h(module, inp, out):
+                t = out[0] if isinstance(out, (tuple, list)) else out
+                if isinstance(t, torch.Tensor):
+                    _store(name, t)
+            return _h
+        def _make_hook_in(name):
+            """Hook that captures the INPUT tensor (for measuring combined vector)."""
+            def _h(module, inp, out):
+                if inp and isinstance(inp[0], torch.Tensor):
+                    _store(name, inp[0])
+            return _h
+        _hooks = [
+            self.model.shared_text_encoder.final_proj.register_forward_hook(
+                _make_hook("text_final_proj_out")),
+            self.model.latent_predictor.output_proj.register_forward_hook(
+                _make_hook("latent_delta")),
+            self.model.survival_module.input_proj.register_forward_hook(
+                _make_hook("surv_input_proj")),
+            self.model.survival_module.two_way_attn.register_forward_hook(
+                _make_hook("two_way_attn_seq1_out")),
+            # capture combined = [pre_mean, pred_mean, delta_mean] BEFORE fusion
+            self.model.survival_module.modality_fusion[0].register_forward_hook(
+                _make_hook_in("combined_input")),
+            self.model.survival_module.modality_fusion[0].register_forward_hook(
+                _make_hook("surv_fusion_fc1")),
+            self.model.survival_module.modality_fusion[4].register_forward_hook(
+                _make_hook("surv_fusion_fc2")),
+            self.model.survival_module.risk_head[0].register_forward_hook(
+                _make_hook("risk_head_fc1")),
+            self.model.survival_module.risk_head[-1].register_forward_hook(
+                _make_hook("risk_head_out")),
+            self.model.survival_module.survival_head[0].register_forward_hook(
+                _make_hook("surv_head_fc1")),
+            self.model.survival_module.survival_head[-1].register_forward_hook(
+                _make_hook("surv_head_out")),
+        ]
+        _debug_done = False
+
         pbar = tqdm(self.val_loader, desc="Validation")
         for batch in pbar:
             outputs = self._shared_step(batch, compute_contrastive=False)
+
+            if not _debug_done:
+                for h in _hooks:
+                    h.remove()
+                _hooks.clear()
+                _debug_done = True
+                _pl = outputs["risk_score"].float()
+                _pre = batch["pre_latent"].float()
+                sm = self.model.survival_module
+                print(f"\n  [DEBUG-VAL first batch]  (batch_std=cross-sample, feat_std=within-sample)")
+                print(f"    {'layer':<30}  batch_std   feat_std    mean")
+                print(f"    {'pre_latent':<30}  {_pre.reshape(_pre.shape[0],-1).std(dim=0).mean():.4f}      {_pre.reshape(_pre.shape[0],-1).std(dim=1).mean():.4f}      {_pre.mean():.4f}")
+                for name, (bstd, fstd, mean) in sorted(_debug.items()):
+                    print(f"    {name:<30}  {bstd:.4f}      {fstd:.4f}      {mean:.4f}")
+                print(f"    risk_score (batch):             std={_pl.std():.6f}  mean={_pl.mean():.4f}")
+                # Weight norms for final heads
+                print(f"    risk_head[-1].weight  norm={sm.risk_head[-1].weight.norm():.4f}  |bias|={sm.risk_head[-1].bias.abs().mean():.4f}")
+                print(f"    surv_head[-1].weight  norm={sm.survival_head[-1].weight.norm():.4f}  |bias|={sm.survival_head[-1].bias.abs().mean():.4f}")
+
             for key in epoch_losses:
                 epoch_losses[key].append(outputs["loss_dict"][key])
 
             all_risks.append(outputs["risk_score"].cpu())
             all_survival_times.append(outputs["survival_time"].cpu())
             all_events.append(outputs["event_indicator"].cpu())
-            all_survival_probs.append(torch.sigmoid(outputs["survival_prob"]).cpu())
-            all_one_year_labels.append(
-                self._one_year_labels(
-                    outputs["survival_time"], outputs["event_indicator"]
-                ).cpu()
+            one_year_labels, one_year_mask = one_year_survival_targets_torch(
+                outputs["survival_time"], outputs["event_indicator"]
             )
+            one_year_mask = one_year_mask.bool()
+            if one_year_mask.any():
+                all_survival_probs.append(
+                    torch.sigmoid(outputs["survival_logit"]).cpu()[one_year_mask.cpu()]
+                )
+                all_one_year_labels.append(one_year_labels.cpu()[one_year_mask.cpu()])
 
         avg_losses = {k: float(np.mean(v)) for k, v in epoch_losses.items()}
         c_index, auc = self._compute_epoch_metrics(
@@ -236,6 +293,15 @@ class Trainer:
             all_survival_probs,
             all_one_year_labels,
         )
+
+        # --- 诊断：val risk score 分布 ---
+        _risks = torch.cat(all_risks).squeeze().numpy()
+        _surv  = torch.cat(all_survival_times).numpy()
+        _corr  = float(np.corrcoef(_risks, _surv)[0, 1]) if _risks.std() > 1e-6 else float('nan')
+        print(
+            f"  [diag-val]   risk: std={_risks.std():.4f}  corr(risk,surv)={_corr:.3f}"
+        )
+
         return avg_losses, c_index, auc
 
     @staticmethod
@@ -249,12 +315,17 @@ class Trainer:
         all_risks = torch.cat(all_risks).squeeze().numpy()
         all_survival_times = torch.cat(all_survival_times).numpy()
         all_events = torch.cat(all_events).numpy()
-        all_survival_probs = torch.cat(all_survival_probs).squeeze().numpy()
-        all_one_year_labels = torch.cat(all_one_year_labels)
+        if all_survival_probs:
+            all_survival_probs = torch.cat(all_survival_probs).squeeze().numpy()
+            all_one_year_labels = torch.cat(all_one_year_labels)
+        else:
+            all_survival_probs = np.array([])
+            all_one_year_labels = torch.tensor([])
 
         c_index = concordance_index(all_risks, all_survival_times, all_events)
         if (
-            all_one_year_labels.sum() == 0
+            len(all_one_year_labels) == 0
+            or all_one_year_labels.sum() == 0
             or all_one_year_labels.sum() == len(all_one_year_labels)
         ):
             auc = 0.5
@@ -284,7 +355,23 @@ class Trainer:
         print(f"Contrastive loss weight: {self.contrastive_weight}")
         print("-" * 80)
 
+        warmup_epochs = 20  # Phase 1: L1-only to train LatentPredictor
+
         for epoch in range(start_epoch, num_epochs + 1):
+            # --- Phase switching ---
+            if epoch <= warmup_epochs:
+                if epoch == start_epoch or epoch == 1:
+                    print(f"[Phase 1] Epochs 1-{warmup_epochs}: L1-only warmup (λ=1,0,0)")
+                self.model.lambda_l1.fill_(1.0)
+                self.model.lambda_cox.fill_(0.0)
+                self.model.lambda_bce.fill_(0.0)
+            else:
+                if epoch == warmup_epochs + 1:
+                    print(f"[Phase 2] Epoch {epoch}+: full survival training (λ=3,2,1)")
+                self.model.lambda_l1.fill_(3.0)
+                self.model.lambda_cox.fill_(2.0)
+                self.model.lambda_bce.fill_(1.0)
+
             train_losses, train_c_index, train_auc = self.train_epoch(epoch)
             val_losses, val_c_index, val_auc = self.validate()
             self.scheduler.step()
@@ -314,7 +401,7 @@ class Trainer:
             )
             print(f"LR: {self.optimizer.param_groups[0]['lr']:.6f}")
 
-            if val_c_index > self.best_c_index:
+            if epoch > warmup_epochs and val_c_index > self.best_c_index:
                 self.best_c_index = val_c_index
                 self.save_checkpoint(epoch, "best_c_index.pth")
                 print(f"Saved best C-index model ({val_c_index:.4f})")
@@ -360,15 +447,9 @@ class Trainer:
 def build_dataloaders(args):
     data_cfg = Config(
         timeline_json=args.timeline_json,
-        features_csv=None,
+        features_csv=args.features_csv,
     )
-    full_dataset = GliomaDatasetWithMRI(
-        data_cfg,
-        mri_data_root=args.mri_root,
-        load_mri=True,
-        target_size=(args.mri_size, args.mri_size, args.mri_size),
-        include_between=False,
-    )
+    full_dataset = GliomaAllPairsTextDataset(data_cfg, include_between=False)
 
     print("Splitting dataset by patient ID (80/20 split)...")
     patient_to_indices = {}
@@ -418,7 +499,7 @@ def build_dataloaders(args):
         f"({len(val_dataset) / len(full_dataset):.1%})"
     )
 
-    collate_fn = GliomaDatasetWithMRI.collate_fn_with_mri
+    collate_fn = GliomaAllPairsTextDataset.collate_fn
     pin_memory = torch.cuda.is_available()
     train_loader = DataLoader(
         train_dataset,
@@ -440,40 +521,28 @@ def build_dataloaders(args):
 
 
 def build_model(args, device):
-    model = MRITimeAwareSurvivalPredictor(
-        vision_checkpoint_path=args.vision_checkpoint,
-        mri_img_size=(args.mri_size, args.mri_size, args.mri_size),
-        freeze_vision_backbone=args.freeze_vision_backbone,
-        vision_lora_r=0 if args.vision_full_finetune else args.vision_lora_r,
-        vision_lora_alpha=args.vision_lora_alpha,
-        vision_lora_dropout=args.vision_lora_dropout,
+    model = TimeAwareGliomaSurvivalPredictor(
         text_encoder_name=args.text_encoder_name,
         freeze_text_encoder=args.freeze_text_encoder,
         text_output_dim=768,
         time_dim=128,
         time_encoding_type="fourier",
-        latent_dim=768,
+        latent_dim=767,
         num_modalities=4,
         predictor_hidden_dim=512,
         predictor_num_layers=4,
         predictor_num_heads=8,
         survival_hidden_dim=128,
         lambda_l1=5.0,
-        lambda_cox=2.0,
+        lambda_cox=3.0,
         lambda_bce=1.0,
-        dropout=0.2,
+        dropout=0.3,
     ).to(device)
 
     param_count = model.get_parameter_count()
     print("\nModel statistics:")
     print(f"  Total parameters: {param_count['total']:,}")
     print(f"  Trainable parameters: {param_count['trainable']:,}")
-    print(f"  Vision backbone parameters: {param_count['vision_backbone']:,}")
-    print(
-        f"  Vision backbone trainable parameters: "
-        f"{param_count['vision_backbone_trainable']:,}"
-    )
-    print(f"  Vision LoRA modules: {param_count['vision_lora_modules']}")
     return model
 
 
@@ -487,19 +556,13 @@ def build_optimizer(args, model):
                 {"params": params, "lr": lr, "weight_decay": weight_decay}
             )
 
-    add_group(model.drug_projection.parameters(), args.lr, 1e-4)
-    add_group(model.context_projection.parameters(), args.lr, 1e-4)
-    add_group(model.latent_predictor.time_encoder.parameters(), args.lr, 1e-4)
+    add_group(model.latent_predictor.time_proj.parameters(), args.lr, 1e-4)
     add_group(
-        [
-            param
-            for name, param in model.latent_predictor.named_parameters()
-            if "time_encoder" not in name
-        ],
+        [p for n, p in model.latent_predictor.named_parameters() if "time_proj" not in n],
         args.lr * 0.1,
         1e-5,
     )
-    add_group(model.survival_module.parameters(), args.lr * 0.1, 1e-3)
+    add_group(model.survival_module.parameters(), args.lr, 1e-5)
 
     text_lora_params = []
     text_proj_params = []
@@ -513,22 +576,9 @@ def build_optimizer(args, model):
             text_proj_params.append(param)
         else:
             text_other_params.append(param)
-
-    vision_lora_params = []
-    vision_other_params = []
-    for name, param in model.vision_backbone.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "lora_" in name:
-            vision_lora_params.append(param)
-        else:
-            vision_other_params.append(param)
-
     add_group(text_lora_params, args.text_lr, 0.0)
     add_group(text_proj_params, args.text_proj_lr, 1e-4)
     add_group(text_other_params, args.text_lr, 0.0)
-    add_group(vision_lora_params, args.vision_lr, 0.0)
-    add_group(vision_other_params, args.vision_full_lr, 1e-5)
 
     if not optimizer_groups:
         raise ValueError("No trainable parameter groups were created.")
@@ -543,50 +593,39 @@ def parse_args():
     parser.add_argument("--exp_name", type=str, default="mri_backbone_survival")
     parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--val_batch_size", type=int, default=4)
+    parser.add_argument("--num_epochs", type=int, default=70)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--val_batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--text_lr", type=float, default=1e-4)
     parser.add_argument("--text_proj_lr", type=float, default=5e-4)
     parser.add_argument("--vision_lr", type=float, default=5e-5)
     parser.add_argument("--vision_full_lr", type=float, default=1e-5)
-    parser.add_argument("--contrastive_weight", type=float, default=0.1)
+    parser.add_argument("--contrastive_weight", type=float, default=0.0)
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
-    parser.add_argument("--mri_size", type=int, default=96)
-    parser.add_argument("--mri_root", type=str, default="./datasets/MU-Glioma-Post")
+    parser.add_argument(
+        "--features_csv",
+        type=str,
+        default="./Predictor/dataset/MU_Glioma_Post/features_output.csv",
+    )
     parser.add_argument(
         "--timeline_json",
         type=str,
         default="./Predictor/dataset/MU_Glioma_Post/clinical_latest.json",
     )
-    parser.add_argument(
-        "--vision_checkpoint",
-        type=str,
-        default="./BrainIAC-main/src/checkpoints/BrainIAC.ckpt",
-        help="Checkpoint for the MRI foundation/BrainIAC vision backbone.",
-    )
     parser.add_argument("--text_encoder_name", type=str, default=TEXT_ENCODER_NAME)
     parser.add_argument("--freeze_text_encoder", action="store_true")
-    parser.add_argument("--vision_lora_r", type=int, default=8)
-    parser.add_argument("--vision_lora_alpha", type=int, default=16)
-    parser.add_argument("--vision_lora_dropout", type=float, default=0.1)
-    parser.add_argument(
-        "--vision_full_finetune",
-        action="store_true",
-        help="Disable LoRA and full-finetune the entire BrainIAC backbone.",
-    )
-    parser.add_argument(
-        "--freeze_vision_backbone",
-        action="store_true",
-        help="Freeze the MRI vision backbone and train only the temporal/survival heads.",
-    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    features_path = Path(args.features_csv)
+    if not features_path.exists():
+        raise FileNotFoundError(f"features_csv not found: {features_path}")
+    print(f"Using precomputed latent features from {features_path}")
+
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -615,7 +654,7 @@ def main():
     )
 
     print(f"\n{'=' * 80}")
-    print("Starting MRI-backbone survival training...")
+    print("Starting latent-space survival training...")
     print(f"{'=' * 80}\n")
     trainer.train(num_epochs=args.num_epochs, resume_from=args.resume_from)
 
