@@ -1,137 +1,225 @@
 # CLARITY
 
-CLARITY is the current public code release for our MRI-conditioned survival modeling and inverse treatment planning pipeline for glioma longitudinal data.
+CLARITY is the official code release for our paper:
 
+> **CLARITY: Medical World Model for Guiding Treatment Decisions by Modeling Context-Aware Disease Trajectories in Latent Space**
+> Tianxingjian Ding, Yuanhao Zou, Chen Chen, Mubarak Shah, Yu Tian
+> arXiv:2512.08029 (2025)
+
+The repository includes:
+
+- **World Model** — MRI-conditioned latent transition predictor with BrainIAC vision encoder + MedGemma text encoder
+- **Survival Module** — Cox PH + BCE survival prediction head
+- **ISE (Individual Survival Estimation)** — two-stage treatment planning: LLM proposes candidates → world model ranks them
+
+---
 
 ## Installation
 
-Use Python 3.10 and install dependencies with:
+Python 3.10 required.
 
 ```bash
 pip install -r requirements.txt
 ```
 
-For inverse planning with `main.py`, set:
+---
 
-```bash
-export OPENAI_API_KEY=your_api_key_here
+## Data Setup
+
+The following external files are required but not distributed in this repository.
+Place them at the paths shown (relative to the CLARITY root):
+
+```
+BrainIAC-main/src/checkpoints/BrainIAC.ckpt        # BrainIAC ViT-B weights
+Predictor/dataset/MU_Glioma_Post/features_output.csv  # pre-extracted BrainIAC features
+Predictor/dataset/MU_Glioma_Post/clinical_latest.json # clinical timeline (JSON)
+datasets/MU-Glioma-Post/                              # raw MRI NIfTI files (from TCIA)
 ```
 
-## Data
+Raw MRI data (MU-Glioma-Post) can be requested from [TCIA](https://www.cancerimagingarchive.net/).
 
-The raw public dataset can be obtained from TCIA.
+---
 
 ## Training
 
-The active training entrypoint is:
+Use the provided script to train exp012 (BrainIAC online encoder + MedGemma):
 
 ```bash
-python Predictor/train.py
-```
-
-This version trains:
-
-- MRI vision backbone
-- MedGemma text encoder
-- time-aware latent transition predictor
-- survival latent predictor
-
-
-### Example Training Command
-
-```bash
-python Predictor/train.py \
-  --exp_name mri_backbone_survival \
-  --timeline_json ./Predictor/dataset/MU_Glioma_Post/clinical_latest.json \
-  --mri_root ./datasets/MU-Glioma-Post \
-  --vision_checkpoint ./BrainIAC-main/src/checkpoints/BrainIAC.ckpt \
-  --mri_size 96 \
-  --batch_size 4 \
-  --val_batch_size 4 \
-  --num_epochs 40
-```
-
-You can also use:
-
-```bash
+cd CLARITY
 bash run_training.sh
 ```
 
-## Inference
-
-Example of inverse treatment planning inference:
+To resume from a checkpoint:
 
 ```bash
-python main.py
+bash run_training.sh --resume path/to/checkpoint.pth
 ```
 
-`main.py` currently runs through the example block under `if __name__ == "__main__":`.
-Before running it, edit the following fields in `main.py` to match your case:
+Or run the training script directly with custom arguments:
 
-- `WORLD_MODEL_PATH`
-- `pre_treatment_latent`
-- patient clinical profile
-- `pre_payload`
-- `between_payload`
+```bash
+export PYTHONPATH=Predictor:.
+python Predictor/train.py \
+  --exp_name          exp012_cf_diversity \
+  --features_csv      Predictor/dataset/MU_Glioma_Post/features_output.csv \
+  --timeline_json     Predictor/dataset/MU_Glioma_Post/clinical_latest.json \
+  --mri_data_dir      datasets/MU-Glioma-Post \
+  --brainiac_ckpt     BrainIAC-main/src/checkpoints/BrainIAC.ckpt \
+  --brainiac_tokens   8 \
+  --brainiac_lora_r   8 \
+  --latent_dim        768 \
+  --num_modalities    32 \
+  --text_encoder_name google/medgemma-4b-it \
+  --num_epochs        100 \
+  --batch_size        16
+```
 
-## Inverse Survival Evaluation
+The model trains:
 
-The core function is:
+- **Vision backbone** (pluggable — BrainIAC ViT-B by default, LoRA fine-tuned)
+- MedGemma-4B text encoder (LoRA fine-tuned)
+- Time-aware latent transition predictor
+- Cox PH + BCE survival prediction head
+- Counterfactual diversity loss (encourages treatment-discriminative latent space)
+
+### Using a different vision backbone
+
+The world model accepts any backbone that implements `VisionBackbone`:
 
 ```python
-glioma_sequence_exploration(...)
+from models.vision_backbone import VisionBackbone, MultiModalVisionBackbone
+
+class MyBackbone(VisionBackbone):
+    @property
+    def tokens_per_modality(self): return 8
+    @property
+    def hidden_dim(self): return 768
+    def forward(self, x):   # x: [B, 1, D, H, W]
+        return self.my_vit(x)[:, :8, :]
+
+backbone = MultiModalVisionBackbone(MyBackbone(), num_modalities=4)
+model = TimeAwareGliomaSurvivalPredictor(..., vision_backbone=backbone)
 ```
 
-defined in `main.py`.
+The BrainIAC adapter (`Predictor/models/brainiac_adapter.py`) is provided as the reference implementation — it requires the BrainIAC checkpoint (not redistributed).
 
-The current inverse pipeline works as follows:
+---
 
-1. Generate candidate post-treatment actions with the LLM policy
-2. Repair candidates using clinical guardrails
-3. Evaluate candidates with the survival/world model
-4. Rank sequences by predicted risk, toxicity, complexity, and uncertainty
-5. Return the best treatment sequence and top-ranked alternatives
+## ISE Evaluation
 
-It supports:
+ISE (Individual Survival Estimation) is a two-stage pipeline:
 
-- single-step inverse evaluation with `planning_horizon=1`
-- long-horizon inverse planning with `planning_horizon>1`
+1. **LLM proposes 3–5 clinically plausible treatment candidates** for the patient's specific treatment phase (adjuvant, salvage, newly diagnosed, etc.)
+2. **World model evaluates and ranks** those candidates via multi-step rollout
 
-Important arguments in `glioma_sequence_exploration(...)`:
+```bash
+export PYTHONPATH=Predictor:.
+python ise_eval_v2.py
+```
 
-- `pre_treatment_latent`
-- `clinical`
-- `imaging`
-- `pre_payload`
-- `between_payload`
-- `world_model_path`
-- `num_llm_sequences`
-- `num_variants`
-- `top_k`
-- `planning_horizon`
-- `discount_factor`
-- `entropy_temperature`
+### With a real LLM (Claude or GPT-4)
+
+Set your API key before running:
+
+```bash
+# Claude (recommended)
+export ANTHROPIC_API_KEY=your_key_here
+export ISE_LLM_MODEL=claude-opus-4-8   # default
+
+# or GPT-4
+export OPENAI_API_KEY=your_key_here
+export ISE_LLM_MODEL=gpt-4o
+```
+
+Without an API key the script falls back automatically to the built-in clinical rule engine (no LLM call, fully offline).
+
+### w_surv sweep
+
+To explore the effect of the survival-probability bonus weight on ISE ranking:
+
+```bash
+python ise_surv_sweep.py
+```
+
+This collects rollouts once (GPU) and re-scores all `w_surv` values on CPU — much faster than re-running the full evaluation per value.
+
+---
+
+## ISE Module API
+
+```python
+from ise_llm import ISECandidateGenerator
+from main import SequenceWorldModel, SequenceScorer
+
+# Stage 1: LLM generates candidates
+gen = ISECandidateGenerator(api_key="...", model="claude-opus-4-8")
+candidates = gen.propose(patient_context, pre_actions)
+
+# Stage 2: world model scores and ranks
+world  = SequenceWorldModel(model_path="path/to/checkpoint.pth")
+scorer = SequenceScorer(w_risk=1.0, w_tox=0.2, w_comp=0.1, w_unc=0.15)
+
+for label, seq in candidates:
+    rollout = world.rollout_trajectory(pre_latent, clinical_text, seq_json, ...)
+    score   = scorer.score(seq, rollout, clinical_profile)
+
+# Full feedback loop (LLM ↔ world model, 2 rounds)
+final_ranking = gen.propose_with_feedback_loop(
+    patient_context, pre_actions,
+    world_model=world, pre_latent=pre_latent, ...
+    n_rounds=2
+)
+```
+
+---
+
+## Repository Structure
+
+```
+CLARITY/
+├── main.py                  # ISE framework (SequenceWorldModel, SequenceScorer, ...)
+├── ise_llm.py               # LLM candidate generator (Claude / GPT-4 / rule engine)
+├── ise_eval_v2.py           # F1 evaluation: ISE vs LLM vs Oracle
+├── ise_surv_sweep.py        # w_surv hyperparameter sweep
+├── run_training.sh          # training launch script
+├── requirements.txt
+├── treatment_constraints.json
+├── Policy/
+│   ├── types.py             # TreatmentBlock, TreatmentSequence, ClinicalProfile
+│   ├── guardrails.py        # clinical safety constraints
+│   └── toxicity_rules.py
+├── Predictor/
+│   ├── train.py             # training entry point
+│   ├── dataset/             # GliomaAllPairsTextDataset, context vectorizer
+│   ├── models/
+│   │   ├── full_model.py    # TimeAwareGliomaSurvivalPredictor (BrainIAC + MedGemma)
+│   │   ├── survival_module.py
+│   │   └── latent_predictor.py
+│   ├── losses/              # Cox PH, Breslow, MTLR
+│   └── utils/
+├── mri_foundation/          # SAM ViT-B source (weights downloaded separately)
+└── expert_eval/             # neuro-oncologist expert evaluation cases
+```
+
+---
 
 ## Citation
 
-If you find this repository helpful, please cite:
-
 ```bibtex
 @article{ding2025clarity,
-  title={CLARITY: Medical World Model for Guiding Treatment Decisions by Modeling Context-Aware Disease Trajectories in Latent Space},
+  title={CLARITY: Medical World Model for Guiding Treatment Decisions by
+         Modeling Context-Aware Disease Trajectories in Latent Space},
   author={Ding, Tianxingjian and Zou, Yuanhao and Chen, Chen and Shah, Mubarak and Tian, Yu},
   journal={arXiv preprint arXiv:2512.08029},
   year={2025}
 }
 ```
 
-## Acknowledgement
+## Acknowledgements
 
-This codebase acknowledges prior and related foundation-model components including:
-
-- MRI-CORE
-- BrainIAC
+- [BrainIAC](https://github.com/...) — 3D MRI ViT-B foundation model
+- [MedGemma](https://huggingface.co/google/medgemma-4b-it) — medical vision-language model
 
 ## License
 
-This repository is released under the MIT License. See `LICENSE`.
+MIT License. See `LICENSE`.

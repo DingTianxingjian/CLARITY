@@ -2,20 +2,60 @@
 优化版胶质瘤生存预测模型：共享文本编码器 + 时间编码
 关键改进：正确处理时间差信息
 """
+import sys
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModel
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import math
 from models.survival_module import SurvivalModule
 from utils.metrics import one_year_survival_targets_torch
 
-try:
-    from monai.networks.nets import ViT as MonaiViT
-except ImportError:
-    MonaiViT = None
+
+
+def extract_drug_category(drugs_text: str) -> str:
+    """
+    Parse the drug JSON string produced by GliomaAllPairsTextDataset into a
+    canonical category string: e.g. "TMZ+RT", "TMZ", "no_treatment", "BEV".
+
+    Combines agents from both pre and post action blocks so that any treatment
+    active within the pair interval is captured.
+    """
+    import json
+    try:
+        d = json.loads(drugs_text)
+    except Exception:
+        return "unknown"
+
+    agents: set = set()
+    has_rt = False
+    for side in ("pre", "post"):
+        actions = d.get(side, {}).get("actions", {})
+        if not isinstance(actions, dict):
+            continue
+        for cat, items in actions.items():
+            if cat == "radiation":
+                has_rt = True
+            elif cat in ("chemotherapy", "additional_1", "additional_2"):
+                for item in (items if isinstance(items, list) else []):
+                    agent = item.get("agent", "").lower()
+                    if "temozolomide" in agent:
+                        agents.add("TMZ")
+                    elif "bevacizumab" in agent or "avastin" in agent:
+                        agents.add("BEV")
+                    elif agent:
+                        agents.add("OTHER")
+    if has_rt:
+        agents.add("RT")
+    return "+".join(sorted(agents)) if agents else "no_treatment"
+
+# Add mri_foundation to path for SAM encoder
+_MRI_FOUNDATION_ROOT = Path(__file__).resolve().parents[2] / "mri_foundation"
+if str(_MRI_FOUNDATION_ROOT) not in sys.path:
+    sys.path.insert(0, str(_MRI_FOUNDATION_ROOT))
 
 
 class LoRALinear(nn.Module):
@@ -43,7 +83,9 @@ class LoRALinear(nn.Module):
             self.base_layer.bias.requires_grad = False
 
     def forward(self, x):
-        base_out = self.base_layer(x)
+        # base weights are frozen — run under no_grad to skip storing activations
+        with torch.no_grad():
+            base_out = self.base_layer(x)
         lora_hidden = F.linear(self.lora_dropout(x), self.lora_A)
         lora_out = F.linear(lora_hidden, self.lora_B)
         return base_out + lora_out * self.scaling
@@ -76,115 +118,191 @@ def inject_lora_modules(
     return replaced_modules
 
 
-class BrainIACVisionBackbone(nn.Module):
+
+
+class SliceAttentionPooling(nn.Module):
     """
-    BrainIAC-style ViT backbone used as the MRI foundation vision encoder.
-    The checkpoint layout matches the repository's BrainIAC checkpoints where
-    encoder weights are stored under the ``backbone.`` prefix.
+    Learnable attention pooling over spatial patch tokens.
+
+    Input:  [B, H*W, embed_dim]  (ViT patch tokens from one slice, before neck)
+    Output: [B, out_dim]
+
+    Uses a single learnable query vector to attend over spatial tokens,
+    learning WHICH patches matter (e.g. tumour region) rather than averaging all.
+    Followed by a projection to out_dim.
     """
+    def __init__(self, embed_dim: int = 768, out_dim: int = 256, num_heads: int = 8):
+        super().__init__()
+        self.query = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.trunc_normal_(self.query, std=0.02)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.proj = nn.Linear(embed_dim, out_dim)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """tokens: [B, N, embed_dim]  →  [B, out_dim]"""
+        B = tokens.shape[0]
+        q = self.query.expand(B, -1, -1)               # [B, 1, D]
+        pooled, _ = self.attn(q, tokens, tokens)        # [B, 1, D]
+        pooled = self.norm(pooled.squeeze(1))           # [B, D]
+        return self.proj(pooled)                        # [B, out_dim]
+
+
+class SAMMRIEncoder(nn.Module):
+    """
+    SAM ViT-B encoder (plan B): bypass the neck, use raw ViT patch tokens.
+
+    Key differences from v1 (avg-pool on neck output):
+      - Neck is bypassed entirely: ViT block outputs [B, 64, 64, 768] patch tokens
+      - SliceAttentionPooling replaces global avg-pool: learns to attend tumour patches
+      - LoRA injected into ViT qkv + proj: end-to-end fine-tuning
+      - out_dim=256 preserved for compatibility with downstream LatentPredictor
+
+    Input (online mode):  raw NIfTI volumes loaded per batch [B, 4, H, W, D]
+    Output:               [B, 4*D_sel, 256]  (D_sel selected axial slices)
+
+    D_sel < 155 because 155 slices × 4 modalities × full ViT forward is too slow.
+    We sample the central `num_slices` slices per modality (tumour is usually central).
+    """
+
+    IMG_SIZE  = 256   # MRI native ~251×251; 256→16×16=256 patches, minimal upscaling
+    EMBED_DIM = 768   # SAM ViT-B hidden dim
+    OUT_DIM   = 256   # output per slice token
 
     def __init__(
         self,
-        checkpoint_path: str,
-        img_size=(96, 96, 96),
-        patch_size=(16, 16, 16),
-        hidden_size: int = 768,
-        lora_r: int = 8,
+        sam_ckpt: str,
+        lora_r: int = 4,
         lora_alpha: int = 16,
         lora_dropout: float = 0.1,
-        lora_target_modules=("qkv", "out_proj"),
+        num_slices: int = 32,   # central slices sampled per modality (VRAM budget)
+        out_dim: int = 256,
     ):
         super().__init__()
-        if MonaiViT is None:
-            raise ImportError("MONAI is required to use the MRI vision backbone.")
+        self.num_slices = num_slices
+        self.out_dim = out_dim
 
-        try:
-            self.backbone = MonaiViT(
-                in_channels=1,
-                img_size=img_size,
-                patch_size=patch_size,
-                hidden_size=hidden_size,
-                mlp_dim=3072,
-                num_layers=12,
-                num_heads=12,
-                save_attn=True,
+        # ── load SAM ViT-B ──────────────────────────────────────────────────
+        import argparse
+        ns = argparse.Namespace(
+            if_encoder_adapter=False, if_mask_decoder_adapter=False,
+            if_encoder_lora_layer=False, if_decoder_lora_layer=False,
+            encoder_adapter_depths=[], encoder_lora_layer=[], decoder_adapt_depth=0,
+        )
+        from models.sam import sam_model_registry
+        sam = sam_model_registry["vit_b"](
+            ns, checkpoint=sam_ckpt, num_classes=1,
+            image_size=1024, pretrained_sam=False,  # load original weights at 1024
+        )
+        self.vit = sam.image_encoder   # full ImageEncoderViT
+        self.register_buffer("pixel_mean", sam.pixel_mean)
+        self.register_buffer("pixel_std",  sam.pixel_std)
+
+        # ── freeze everything first ─────────────────────────────────────────
+        for p in self.vit.parameters():
+            p.requires_grad = False
+
+        # ── LoRA on ViT qkv + proj (NOT on neck) ───────────────────────────
+        if lora_r > 0:
+            # Only target blocks, not neck
+            replaced = inject_lora_modules(
+                self.vit.blocks,
+                target_suffixes=("qkv", "proj"),
+                r=lora_r, alpha=lora_alpha, dropout=lora_dropout,
             )
-        except TypeError:
-            # Compatible with newer MONAI signatures.
-            self.backbone = MonaiViT(
-                in_channels=1,
-                img_size=img_size,
-                patch_size=patch_size,
-                hidden_size=hidden_size,
-                mlp_dim=3072,
-                num_layers=12,
-                num_heads=12,
-                pos_embed="conv",
-                classification=False,
-                dropout_rate=0.0,
-            )
+            print(f"[SAMMRIEncoder-B] LoRA on {len(replaced)} ViT layers (r={lora_r}, skip neck)")
+        else:
+            print("[SAMMRIEncoder-B] Frozen ViT (no LoRA)")
 
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        state_dict = ckpt.get("state_dict", ckpt)
-        backbone_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith("backbone."):
-                backbone_state_dict[key[9:]] = value
+        # ── learnable attention pooling (fully trainable) ───────────────────
+        self.slice_pool = SliceAttentionPooling(
+            embed_dim=self.EMBED_DIM, out_dim=out_dim, num_heads=8
+        )
 
-        if not backbone_state_dict:
-            raise ValueError(
-                f"No BrainIAC backbone weights found in checkpoint: {checkpoint_path}"
-            )
+    # ── preprocessing ────────────────────────────────────────────────────────
 
-        self.backbone.load_state_dict(backbone_state_dict, strict=True)
-        self.lora_enabled = lora_r > 0
-        self.lora_target_modules = tuple(lora_target_modules)
-        self.lora_modules = []
+    def _preprocess_slice(self, slc: torch.Tensor) -> torch.Tensor:
+        """slc: [B, H, W] float  →  [B, 3, 1024, 1024] SAM-normalised (no grad)."""
+        with torch.no_grad():
+            t = slc.unsqueeze(1).expand(-1, 3, -1, -1).float()
+            t = F.interpolate(t, size=(self.IMG_SIZE, self.IMG_SIZE),
+                              mode="bilinear", align_corners=False)
+        pm = self.pixel_mean.view(1, 3, 1, 1)
+        ps = self.pixel_std.view(1, 3, 1, 1)
+        return (t - pm) / ps
 
-        if self.lora_enabled:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-            self.lora_modules = inject_lora_modules(
-                self.backbone,
-                target_suffixes=self.lora_target_modules,
-                r=lora_r,
-                alpha=lora_alpha,
-                dropout=lora_dropout,
-            )
-            if not self.lora_modules:
-                raise ValueError(
-                    "No BrainIAC linear layers matched the requested LoRA targets: "
-                    f"{self.lora_target_modules}"
-                )
+    def _norm_volume(self, vol: torch.Tensor) -> torch.Tensor:
+        """vol: [B, H, W, D] → percentile-normalised [0,255]."""
+        B = vol.shape[0]
+        flat = vol.reshape(B, -1).float()
+        # 1st/99th percentile per volume
+        lo = flat.kthvalue(max(1, int(0.01 * flat.shape[1])), dim=1).values.view(B,1,1,1)
+        hi = flat.kthvalue(min(flat.shape[1], int(0.99 * flat.shape[1])), dim=1).values.view(B,1,1,1)
+        return ((vol.float() - lo) / (hi - lo + 1e-6)).clamp(0, 1) * 255.0
 
-    def forward(self, x):
-        features = self.backbone(x)
-        if isinstance(features, (tuple, list)):
-            features = features[0]
-        return features[:, 0]
+    # ── ViT forward bypassing neck ────────────────────────────────────────────
 
+    def _vit_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Run SAM ViT blocks, return patch tokens BEFORE neck.
+        x: [B, 3, IMG_SIZE, IMG_SIZE]  →  [B, N_patches, 768]
+        IMG_SIZE=256 → 16×16=256 patches (native MRI resolution, no upscaling needed)
+        """
+        x = self.vit.patch_embed(x)           # [B, H', W', 768]
+        if self.vit.pos_embed is not None:
+            # pos_embed was trained for 64×64; interpolate to actual patch grid size
+            pe = self.vit.pos_embed           # [1, 64, 64, 768]
+            h, w = x.shape[1], x.shape[2]
+            if pe.shape[1] != h or pe.shape[2] != w:
+                pe = pe.permute(0, 3, 1, 2)  # [1, 768, 64, 64]
+                pe = F.interpolate(pe, size=(h, w), mode="bilinear", align_corners=False)
+                pe = pe.permute(0, 2, 3, 1)  # [1, h, w, 768]
+            x = x + pe
+        from torch.utils.checkpoint import checkpoint
+        for blk in self.vit.blocks:
+            x = checkpoint(blk, x, use_reentrant=False)
+        return x.reshape(x.shape[0], -1, self.EMBED_DIM)  # [B, N_patches, 768]
 
-class MultiModalMRIBackbone(nn.Module):
-    """Apply a shared single-modality MRI backbone across all four modalities."""
+    # ── encode one modality volume ────────────────────────────────────────────
 
-    def __init__(self, backbone: nn.Module, num_modalities: int = 4):
-        super().__init__()
-        self.backbone = backbone
-        self.num_modalities = num_modalities
+    def _encode_volume(self, vol: torch.Tensor) -> torch.Tensor:
+        """
+        vol: [B, H, W, D]
+        returns: [B, D_sel, out_dim]   D_sel = num_slices
+        """
+        D = vol.shape[3]
+        vol = self._norm_volume(vol)           # [B, H, W, D]
 
-    def forward(self, mri):
-        if mri.ndim != 5:
-            raise ValueError(f"Expected MRI tensor [B, M, D, H, W], got {tuple(mri.shape)}")
-        if mri.shape[1] != self.num_modalities:
-            raise ValueError(
-                f"Expected {self.num_modalities} modalities, got {mri.shape[1]}"
-            )
+        # Select central slices (tumour almost always within central 1/3 of brain)
+        mid = D // 2
+        half = self.num_slices // 2
+        z_start = max(0, mid - half)
+        z_end   = min(D, z_start + self.num_slices)
+        z_start = max(0, z_end - self.num_slices)  # re-clamp if near edge
+        z_indices = range(z_start, z_end)
 
-        modality_features = []
-        for modality_idx in range(self.num_modalities):
-            modality_volume = mri[:, modality_idx : modality_idx + 1]
-            modality_features.append(self.backbone(modality_volume))
-        return torch.stack(modality_features, dim=1)
+        # Process one slice at a time across the full batch.
+        # Peak VRAM = 1 ViT forward on [B, 3, 256, 256] with grad-checkpoint ≈ 3-4 GB.
+        slice_feats = []
+        for z in z_indices:
+            t  = self._preprocess_slice(vol[:, :, :, z])  # [B, 3, 256, 256]
+            tk = self._vit_tokens(t)                       # [B, 256, 768]
+            f  = self.slice_pool(tk)                       # [B, out_dim]
+            slice_feats.append(f)
+        return torch.stack(slice_feats, dim=1)  # [B, D_sel, out_dim]
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def forward(self, mri: torch.Tensor) -> torch.Tensor:
+        """
+        mri: [B, 4, H, W, D]
+        returns: [B, 4*num_slices, out_dim]
+        """
+        assert mri.ndim == 5, f"Expected [B,4,H,W,D], got {tuple(mri.shape)}"
+        mod_feats = []
+        for m in range(mri.shape[1]):
+            mod_feats.append(self._encode_volume(mri[:, m]))  # [B, D_sel, 256]
+        return torch.cat(mod_feats, dim=1)   # [B, 4*D_sel, 256]
 
 
 class PositionalTimeEncoding(nn.Module):
@@ -314,32 +432,29 @@ class SharedTextEncoder(nn.Module):
         self.use_mean_pooling = use_mean_pooling
         self._input_grad_hook = None
 
-        # ✅ BitsAndBytes 量化配置
-        bnb_config = dict(
+        # ✅ BitsAndBytes 量化配置（transformers 5.x: 必须用 BitsAndBytesConfig 对象）
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(
             load_in_4bit=load_in_4bit,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
-        )
+        ) if load_in_4bit else None
 
-        # ✅ 1. 加载模型（2B，显存更友好）
+        load_kwargs = dict(
+            dtype=torch.bfloat16,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+        )
+        if bnb_config is not None:
+            load_kwargs["quantization_config"] = bnb_config
+
+        # ✅ 1. 加载模型
         try:
-            self.model = AutoModel.from_pretrained(
-                model_name,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-                **bnb_config
-            )
+            self.model = AutoModel.from_pretrained(model_name, **load_kwargs)
         except Exception:
             from transformers import AutoModelForCausalLM
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-                **bnb_config
-            )
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.output_dim = getattr(self.model.config, "hidden_size", getattr(self.model.config, "dim", 2560))
@@ -417,7 +532,7 @@ class SharedTextEncoder(nn.Module):
 
 
 
-        emb = self.final_proj(emb)
+        emb = self.final_proj(emb.to(self.final_proj.weight.device))
         emb = F.normalize(emb, p=2, dim=-1)
         return emb
 
@@ -491,6 +606,11 @@ class LatentPredictor(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.output_proj = nn.Linear(hidden_dim, latent_dim)
+        # Direct drug residual path: bypasses transformer attention so CF loss gradient
+        # reaches drug_emb immediately (transformer attention too weak after L1-only pretraining).
+        # std=0.01 → initial residual norm ~0.28, <1% of transformer_out norm → minimal L1 disruption.
+        self.drug_residual_proj = nn.Linear(drug_dim, latent_dim, bias=False)
+        nn.init.normal_(self.drug_residual_proj.weight, std=0.01)
 
     def _encode_time(self, time_delta: torch.Tensor) -> torch.Tensor:
         """Fourier time encoding: [B] → [B, time_dim]"""
@@ -526,8 +646,13 @@ class LatentPredictor(nn.Module):
         tokens = torch.cat([drug_token, time_token, latent_tokens], dim=1)  # [B, M+2, H]
         tokens = self.pos_encoder(tokens)
         encoded = self.transformer(tokens)                         # [B, M+2, H]
-        delta = self.output_proj(encoded[:, 2:, :])               # [B, M, latent_dim]
-        return pre_latent + delta
+        pred_latent = self.output_proj(encoded[:, 2:, :])          # [B, M, latent_dim]
+        # Direct additive drug residual: CF-loss gradient flows here without
+        # traversing 4 transformer layers.  Initialised at 0 → no L1 disruption on resume.
+        drug_res = self.drug_residual_proj(drug_emb).unsqueeze(1)  # [B, 1, latent_dim]
+        return pred_latent + drug_res                               # broadcast over M tokens
+
+
 
 
 class TimeAwareGliomaSurvivalPredictor(nn.Module):
@@ -567,6 +692,10 @@ class TimeAwareGliomaSurvivalPredictor(nn.Module):
         lora_r: int = 8,
         lora_alpha: int = 16,
         dropout: float = 0.3,
+
+        # Optional MRI encoder — pass any MultiModalVisionBackbone instance.
+        # See Predictor/models/brainiac_adapter.py for the BrainIAC reference adapter.
+        vision_backbone: nn.Module = None,
     ):
         super().__init__()
 
@@ -577,6 +706,16 @@ class TimeAwareGliomaSurvivalPredictor(nn.Module):
         self.register_buffer('lambda_l1', torch.tensor(lambda_l1))
         self.register_buffer('lambda_cox', torch.tensor(lambda_cox))
         self.register_buffer('lambda_bce', torch.tensor(lambda_bce))
+
+        # 0. Optional pluggable MRI encoder (any MultiModalVisionBackbone).
+        self.mri_encoder = None
+        if vision_backbone is not None:
+            self.mri_encoder = vision_backbone
+            if hasattr(vision_backbone, "tokens_per_modality"):
+                self.num_modalities = 4 * vision_backbone.tokens_per_modality
+            if hasattr(vision_backbone, "hidden_dim"):
+                latent_dim = vision_backbone.hidden_dim
+                self.latent_dim = latent_dim
 
         # 1. 共享文本编码器 (MedGemma)
         self.shared_text_encoder = SharedTextEncoder(
@@ -605,6 +744,7 @@ class TimeAwareGliomaSurvivalPredictor(nn.Module):
         )
 
         # 3. Two-way attention survival module
+        # condition_dim=text_output_dim*2: clinical+drug emb fed into fusion (not a bypass shortcut)
         self.survival_module = SurvivalModule(
             latent_dim=latent_dim,
             num_modalities=num_modalities,
@@ -612,20 +752,37 @@ class TimeAwareGliomaSurvivalPredictor(nn.Module):
             num_twoway_layers=2,
             num_heads=predictor_num_heads,
             dropout=dropout,
+            condition_dim=text_output_dim * 2,
         )
+
     
-    def forward(self, pre_latent, drugs_text, time_delta, clinical_text=None):
+    def encode_mri_raw(self, pre_mri: torch.Tensor, post_mri: torch.Tensor):
+        """
+        Encode raw MRI volumes through the SAM encoder (only valid when sam_ckpt is set).
+        pre_mri / post_mri: [B, 4, H, W, D]
+        Returns: pre_latent [B, 4*D, 256], post_latent [B, 4*D, 256]
+        """
+        assert self.mri_encoder is not None, "sam_ckpt must be set to use encode_mri_raw"
+        return self.mri_encoder(pre_mri), self.mri_encoder(post_mri)
+
+    def forward(self, pre_latent, drugs_text, time_delta, clinical_text=None,
+                pre_mri=None):
         """
         Args:
-            pre_latent:    [B, M, latent_dim]
+            pre_latent:    [B, M, latent_dim]  — pre-computed features OR None
             drugs_text:    List[str]
             time_delta:    [B]  days between pre and post scan
             clinical_text: List[str] (optional; zeros used when absent)
+            pre_mri:       [B, 4, H, W, D] raw MRI (replaces pre_latent when mri_encoder enabled)
         Returns:
             predicted_latent: [B, M, latent_dim]
             risk_score:       [B, 1]
             survival_logit:   [B, 1]
         """
+        # 0. Optionally encode raw MRI on-the-fly
+        if self.mri_encoder is not None and pre_mri is not None:
+            pre_latent = self.mri_encoder(pre_mri)
+
         # 1. Encode drug text and clinical context through MedGemma
         drug_emb = self.shared_text_encoder(drugs_text)           # [B, D]
         if clinical_text and any(clinical_text):
@@ -637,11 +794,13 @@ class TimeAwareGliomaSurvivalPredictor(nn.Module):
         # 2. Predict post-latent conditioned on drug, clinical context, and time
         predicted_latent = self.latent_predictor(pre_latent, condition_emb, time_delta)
 
-        # 3. Survival prediction via two-way attention on (pre, predicted_post)
-        risk_score, survival_logit = self.survival_module(pre_latent, predicted_latent)
+        # 3. Survival prediction: MRI two-way attention + clinical condition fusion
+        risk_score, survival_logit = self.survival_module(
+            pre_latent, predicted_latent, condition_emb
+        )
 
-        return predicted_latent, risk_score, survival_logit
-    
+        return predicted_latent, risk_score, survival_logit, condition_emb
+
     def compute_loss(self, pred_latent, risk_score, survival_logit,
                      post_latent, survival_time, event_indicator):
         # 1. L1重建损失
@@ -684,47 +843,174 @@ class TimeAwareGliomaSurvivalPredictor(nn.Module):
         
         return total_loss, loss_dict
     
-    def _simple_cox_loss(self, risk_score, survival_time, event_indicator):
-        lr = risk_score.view(-1)
-        t = survival_time.view(-1)
-        e = event_indicator.view(-1)
+    @staticmethod
+    def drug_category_contrastive_loss(
+        drug_categories: list,
+        pred_latent: torch.Tensor,
+        temperature: float = 0.1,
+    ) -> torch.Tensor:
+        """
+        Supervised contrastive loss (SupCon) based on discrete drug categories.
 
-        # 按时间升序排序
+        Same drug category  → positive pair (pull together in latent space)
+        Different category  → negative pair (push apart)
+
+        drug_categories: List[str] length B  — output of extract_drug_category()
+        pred_latent:     [B, M, D]           — predicted post-treatment latents
+
+        Returns 0 if no positive pair exists in this batch (all unique categories).
+        """
+        B = pred_latent.shape[0]
+        if B < 2:
+            return pred_latent.new_tensor(0.0)
+
+        # Build positive mask: same category, exclude self  [B, B]
+        same = torch.tensor(
+            [[i != j and drug_categories[i] == drug_categories[j]
+              for j in range(B)] for i in range(B)],
+            dtype=torch.bool, device=pred_latent.device,
+        )
+        if not same.any():
+            return pred_latent.new_tensor(0.0)
+
+        # Student: mean-pool tokens → unit sphere  [B, D]
+        z = F.normalize(pred_latent.float().mean(dim=1), p=2, dim=-1)
+
+        # Pairwise cosine similarity; mask diagonal to -inf
+        S = torch.mm(z, z.T) / temperature                          # [B, B]
+        S = S.masked_fill(torch.eye(B, dtype=torch.bool, device=S.device), float('-inf'))
+
+        # SupCon: for each anchor, average log-prob of its positives
+        log_Q = F.log_softmax(S, dim=1)                     # [B, B]
+        # Use masked_fill to avoid 0.0 * (-inf) = NaN on diagonal
+        log_Q_pos = log_Q.masked_fill(~same, 0.0)           # zero out non-positives
+        n_pos = same.float().sum(dim=1).clamp(min=1)        # [B]
+        loss_per_sample = -log_Q_pos.sum(dim=1) / n_pos     # [B]
+
+        has_pos = same.any(dim=1)
+        return loss_per_sample[has_pos].mean()
+
+    @staticmethod
+    def variance_loss(pred_latent: torch.Tensor, gamma: float = 0.05) -> torch.Tensor:
+        """VICReg-style variance regularization: penalize dims whose cross-sample
+        std < gamma.  Prevents pred_latent from collapsing to a single vector.
+
+        gamma calibrated to feature scale: pre_latent batch_std ≈ 0.12,
+        so gamma=0.05 gives loss=0 for diverse latents, loss>0 only when collapsed.
+
+        pred_latent: [B, M, D]
+        Returns scalar loss (0 when every dim already has std >= gamma).
+        """
+        if pred_latent.shape[0] < 2:
+            return pred_latent.new_tensor(0.0)
+        z = pred_latent.float().mean(dim=1)          # [B, D] — pool over tokens
+        std = z.std(dim=0)                            # [D]
+        return F.relu(gamma - std).mean()
+
+    @staticmethod
+    def drug_swap_diversity_loss(
+        predictor: nn.Module,
+        pre_latent: torch.Tensor,      # [B, M, D]  (unused but kept for API compat)
+        condition_emb: torch.Tensor,   # [B, 2*text_dim]  cat([drug_emb, clinical_emb])
+        time_delta: torch.Tensor,      # [B]          (unused but kept for API compat)
+        pred_latent: torch.Tensor,     # [B, M, D]   (unused but kept for API compat)
+        drug_categories: list,         # List[str] length B
+        cos_margin: float = 0.9,       # repurposed as L2 distance margin
+    ) -> torch.Tensor:
+        """
+        Drug-swap diversity loss — operates directly on drug_residual_proj outputs.
+
+        Operates on the drug_residual_proj layer rather than the full pred_latent so
+        that the gradient signal is not drowned out by the much larger transformer_out
+        component (which dominates cosine similarity in the full pred_latent space).
+
+        For each pair (i, shuffled_j) with different drug categories, compute:
+            drug_res_real = drug_residual_proj(condition_emb_i)
+            drug_res_cf   = drug_residual_proj(condition_cf_i)  # drug part swapped to j
+        and apply a hinge loss:
+            max(0, l2_margin - ||drug_res_real - drug_res_cf||_2)
+
+        This pushes drug residuals for different treatments apart by at least l2_margin,
+        providing a direct, short-gradient path that converges much faster than
+        pushing full pred_latents apart through the transformer.
+
+        cos_margin is reinterpreted as l2_margin (target L2 distance).
+        """
+        B = condition_emb.shape[0]
+        if B < 4:
+            return condition_emb.new_tensor(0.0)
+
+        # Shuffle indices within batch for drug-swap
+        shuffled_idx = torch.randperm(B, device=condition_emb.device)
+
+        # Mask: only penalise pairs whose drug categories actually differ
+        different = torch.tensor(
+            [drug_categories[i] != drug_categories[shuffled_idx[i].item()]
+             for i in range(B)],
+            dtype=torch.bool, device=condition_emb.device,
+        )
+        if not different.any():
+            return condition_emb.new_tensor(0.0)
+
+        # Counterfactual condition: swap drug_emb (first half), keep clinical_emb (second half)
+        drug_dim = condition_emb.shape[-1] // 2   # text_output_dim (768)
+        cf_condition = condition_emb.clone()
+        cf_condition[:, :drug_dim] = condition_emb[shuffled_idx, :drug_dim]
+
+        # Compute drug residuals directly — short gradient path, no full predictor pass
+        drug_res_real = predictor.drug_residual_proj(condition_emb.float())   # [B, latent_dim]
+        drug_res_cf   = predictor.drug_residual_proj(cf_condition.float())    # [B, latent_dim]
+
+        # L2 distance between residuals for different-drug pairs
+        dist = (drug_res_real - drug_res_cf).norm(dim=-1)  # [B]
+
+        # Hinge: push residuals apart until L2 distance >= l2_margin
+        l2_margin = cos_margin  # parameter reused (0.9 ≈ reasonable L2 target in 768-dim space)
+        return F.relu(l2_margin - dist[different]).mean()
+
+    def _simple_cox_loss(self, risk_score, survival_time, event_indicator):
+        """
+        Breslow-approximation Cox partial likelihood loss.
+
+        Convention: higher risk_score → shorter survival (same as concordance_index).
+
+        Numerically stable: uses log-sum-exp trick and clamps risk to [-10, 10]
+        so exp() never overflows and gradients stay healthy.
+        """
+        lr = risk_score.view(-1).float()
+        t  = survival_time.view(-1)
+        e  = event_indicator.view(-1)
+
+        # Clamp risk to a reasonable range to prevent exp overflow
+        lr = torch.clamp(lr, -10.0, 10.0)
+
+        # Sort ascending by time
         idx = torch.argsort(t)
         lr, t, e = lr[idx], t[idx], e[idx]
 
-        unique_event_times = torch.unique(t[e == 1])
         n_events_total = e.sum()
         if n_events_total == 0:
             return lr.new_tensor(0.0)
 
-        eps = 1e-12
+        # Breslow approximation (no ties correction — simpler, more stable)
+        # Loss = -1/N_events * Σ_{i: event} [ lr_i - log(Σ_{j: t_j>=t_i} exp(lr_j)) ]
         total_loss = lr.new_zeros(())
+        n_events = 0
 
-        for tt in unique_event_times:
-            # 风险集: t >= tt
-            risk_mask = (t >= tt)
-            # 当时刻的事件样本
-            event_mask_t = (t == tt) & (e == 1)
-            d = event_mask_t.sum()
-
-            if d.item() == 0:
+        for i in range(len(lr)):
+            if e[i] == 0:
                 continue
+            # Risk set: all j with t_j >= t_i (since sorted ascending, these are i..end)
+            risk_scores_at_risk = lr[i:]             # [R]
+            # Numerically stable log-sum-exp
+            max_r = risk_scores_at_risk.max()
+            log_sum_exp = max_r + torch.log(
+                torch.exp(risk_scores_at_risk - max_r).sum().clamp(min=1e-12)
+            )
+            total_loss = total_loss - (lr[i] - log_sum_exp)
+            n_events += 1
 
-            # Efron 修正计算
-            sum_lr_events = lr[event_mask_t].sum()
-            sum_exp_risk = torch.exp(lr[risk_mask]).sum()
-            sum_exp_events = torch.exp(lr[event_mask_t]).sum()
-
-            denom = lr.new_zeros(())
-            d_float = d.to(lr.dtype)
-            for j in range(int(d.item())):
-                frac = j / d_float
-                denom = denom + torch.log(torch.clamp(sum_exp_risk - frac * sum_exp_events, min=eps))
-
-            total_loss = total_loss - (sum_lr_events - denom)
-
-        return total_loss / (n_events_total + eps)
+        return total_loss / max(n_events, 1)
     
     def get_parameter_count(self):
         """统计参数量"""
@@ -733,77 +1019,21 @@ class TimeAwareGliomaSurvivalPredictor(nn.Module):
         encoder_params = sum(p.numel() for p in self.shared_text_encoder.parameters())
         predictor_params = sum(p.numel() for p in self.latent_predictor.parameters())
         survival_params = sum(p.numel() for p in self.survival_module.parameters())
-        return {
+        counts = {
             'total': total,
             'trainable': trainable,
-            'encoder': encoder_params,
+            'text_encoder': encoder_params,
             'predictor': predictor_params,
             'survival': survival_params,
         }
-
-
-class MRITimeAwareSurvivalPredictor(TimeAwareGliomaSurvivalPredictor):
-
-
-    def __init__(
-        self,
-        vision_checkpoint_path: str,
-        mri_img_size=(96, 96, 96),
-        freeze_vision_backbone: bool = True,
-        vision_lora_r: int = 8,
-        vision_lora_alpha: int = 16,
-        vision_lora_dropout: float = 0.1,
-        vision_lora_target_modules=("qkv", "out_proj"),
-        **kwargs,
-    ):
-        kwargs.setdefault("latent_dim", 768)
-        kwargs.setdefault("num_modalities", 4)
-        super().__init__(**kwargs)
-
-        self.vision_backbone = MultiModalMRIBackbone(
-            BrainIACVisionBackbone(
-                checkpoint_path=vision_checkpoint_path,
-                img_size=mri_img_size,
-                lora_r=0 if freeze_vision_backbone else vision_lora_r,
-                lora_alpha=vision_lora_alpha,
-                lora_dropout=vision_lora_dropout,
-                lora_target_modules=vision_lora_target_modules,
-            ),
-            num_modalities=self.num_modalities,
-        )
-        self.freeze_vision_backbone = freeze_vision_backbone
-        if self.freeze_vision_backbone:
-            for param in self.vision_backbone.parameters():
-                param.requires_grad = False
-
-    def encode_mri(self, mri):
-        if self.freeze_vision_backbone:
-            with torch.no_grad():
-                return self.vision_backbone(mri)
-        return self.vision_backbone(mri)
-
-    def predict_from_features(self, pre_latent, drugs_text, time_delta, clinical_text=None):
-        return super().forward(pre_latent, drugs_text, time_delta, clinical_text)
-
-    def forward(self, pre_mri, drugs_text, time_delta, clinical_text=None):
-        pre_latent = self.encode_mri(pre_mri)
-        pred_latent, risk_score, survival_prob = self.predict_from_features(
-            pre_latent, drugs_text, time_delta, clinical_text
-        )
-        return pred_latent, risk_score, survival_prob, pre_latent
-
-    def get_parameter_count(self):
-        counts = super().get_parameter_count()
-        vision_total = sum(p.numel() for p in self.vision_backbone.parameters())
-        vision_trainable = sum(
-            p.numel() for p in self.vision_backbone.parameters() if p.requires_grad
-        )
-        counts["vision_backbone"] = vision_total
-        counts["vision_backbone_trainable"] = vision_trainable
-        counts["vision_lora_modules"] = len(
-            getattr(self.vision_backbone.backbone, "lora_modules", [])
-        )
+        if self.mri_encoder is not None:
+            mri_total = sum(p.numel() for p in self.mri_encoder.parameters())
+            mri_trainable = sum(p.numel() for p in self.mri_encoder.parameters() if p.requires_grad)
+            counts['mri_encoder_total'] = mri_total
+            counts['mri_encoder_trainable'] = mri_trainable
         return counts
+
+
 
 
 # 测试代码

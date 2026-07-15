@@ -5,19 +5,19 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
 
 import argparse
+import copy
 import json
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset.dataset_glioma_all_pairs_text import Config, GliomaAllPairsTextDataset
-from models.full_model import TimeAwareGliomaSurvivalPredictor
+from models.full_model import TimeAwareGliomaSurvivalPredictor, extract_drug_category
 from utils.metrics import (
     concordance_index,
     compute_auc,
@@ -26,6 +26,23 @@ from utils.metrics import (
 
 
 TEXT_ENCODER_NAME = "google/medgemma-4b-it"
+
+
+class EarlyStopping:
+    """Stop training when Val C-index stops improving."""
+    def __init__(self, patience: int = 15, min_delta: float = 1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best = 0.0
+        self.wait = 0
+
+    def step(self, val_c_index: float) -> bool:
+        if val_c_index > self.best + self.min_delta:
+            self.best = val_c_index
+            self.wait = 0
+            return False
+        self.wait += 1
+        return self.wait >= self.patience
 
 
 class Trainer:
@@ -39,8 +56,18 @@ class Trainer:
         device,
         save_dir,
         contrastive_weight: float = 0.1,
+        contrastive_temperature: float = 0.1,
+        variance_weight: float = 0.0,
+        cf_weight: float = 0.0,
+        cf_cos_margin: float = 0.9,
         log_interval: int = 10,
         grad_clip_norm: float = 1.0,
+        warmup_epochs: int = 10,
+        lam_l1: float = 3.0,
+        lam_cox: float = 2.0,
+        lam_bce: float = 1.0,
+        early_stopping_patience: int = 0,
+        ema_momentum: float = 0.0,
     ):
         self.model = model
         self.train_loader = train_loader
@@ -51,8 +78,28 @@ class Trainer:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.contrastive_weight = contrastive_weight
+        self.contrastive_temperature = contrastive_temperature
+        self.variance_weight = variance_weight
+        self.cf_weight = cf_weight
+        self.cf_cos_margin = cf_cos_margin
         self.log_interval = log_interval
         self.grad_clip_norm = grad_clip_norm
+        self.warmup_epochs = warmup_epochs
+        self.lam_l1  = lam_l1
+        self.lam_cox = lam_cox
+        self.lam_bce = lam_bce
+        self.early_stopper = (
+            EarlyStopping(patience=early_stopping_patience)
+            if early_stopping_patience > 0 else None
+        )
+        self.ema_momentum = ema_momentum
+        # Build EMA target encoder when requested (momentum > 0 and backbone exists)
+        self.ema_mri_encoder = None
+        if ema_momentum > 0 and model.mri_encoder is not None:
+            self.ema_mri_encoder = copy.deepcopy(model.mri_encoder).to(device)
+            for p in self.ema_mri_encoder.parameters():
+                p.requires_grad_(False)
+            print(f"  EMA target encoder initialised  (momentum={ema_momentum})")
 
         self.best_val_loss = float("inf")
         self.best_c_index = 0.0
@@ -64,14 +111,8 @@ class Trainer:
             "train_auc": [],
             "val_auc": [],
             "train_contrastive_loss": [],
+            "train_cf_loss": [],
         }
-
-    @staticmethod
-    def _compute_contrastive_loss(z_anchor, z_negative, margin=0.5):
-        z_anchor = F.normalize(z_anchor.mean(dim=1), p=2, dim=-1)
-        z_negative = F.normalize(z_negative.mean(dim=1), p=2, dim=-1)
-        cosine_sim = F.cosine_similarity(z_anchor, z_negative)
-        return F.relu(cosine_sim - margin).mean()
 
     def _shared_step(self, batch, compute_contrastive: bool):
         pre_latent = batch["pre_latent"].to(self.device, non_blocking=True)
@@ -82,23 +123,54 @@ class Trainer:
         drugs_text = batch["drugs_text"]
         clinical_text = batch["clinical_text"]
 
-        pred_latent, risk_score, survival_logit = self.model(
+        # Online MRI encoding: bypass frozen NPZ, run ViT+LoRA end-to-end
+        if self.model.mri_encoder is not None and "pre_mri" in batch:
+            pre_mri  = batch["pre_mri"].to(self.device, non_blocking=True)
+            post_mri = batch["post_mri"].to(self.device, non_blocking=True)
+            pre_latent = self.model.mri_encoder(pre_mri)
+            if self.ema_mri_encoder is not None:
+                # JEPA/BYOL-style: post_latent from a slowly evolving EMA encoder.
+                # EMA encoder is never directly gradient-updated → stable target.
+                with torch.no_grad():
+                    post_latent = self.ema_mri_encoder(post_mri)
+            else:
+                # Fallback: stop-gradient on the shared encoder.
+                post_latent = self.model.mri_encoder(post_mri).detach()
+
+        pred_latent, risk_score, survival_logit, condition_emb = self.model(
             pre_latent,
             drugs_text,
             time_delta,
             clinical_text,
         )
 
+        # SupCon + drug-swap CF diversity loss
         contrastive_loss = torch.zeros((), device=self.device)
-        if compute_contrastive:
-            negative_drugs_text = drugs_text[1:] + drugs_text[:1]
-            pred_negative, _, _ = self.model(
-                pre_latent,
-                negative_drugs_text,
-                time_delta,
-                clinical_text,
-            )
-            contrastive_loss = self._compute_contrastive_loss(pred_latent, pred_negative)
+        cf_loss = torch.zeros((), device=self.device)
+        needs_contra = compute_contrastive and (
+            self.contrastive_weight > 0 or self.cf_weight > 0
+        )
+        if needs_contra:
+            drug_categories = [extract_drug_category(t) for t in drugs_text]
+            if self.contrastive_weight > 0:
+                contrastive_loss = self.model.drug_category_contrastive_loss(
+                    drug_categories, pred_latent, temperature=self.contrastive_temperature
+                )
+            if self.cf_weight > 0:
+                cf_loss = self.model.drug_swap_diversity_loss(
+                    predictor=self.model.latent_predictor,
+                    pre_latent=pre_latent,
+                    condition_emb=condition_emb,
+                    time_delta=time_delta,
+                    pred_latent=pred_latent,
+                    drug_categories=drug_categories,
+                    cos_margin=self.cf_cos_margin,
+                )
+
+        # Variance regularization: penalize pred_latent collapse (VICReg-style)
+        var_loss = torch.zeros((), device=self.device)
+        if self.variance_weight > 0:
+            var_loss = self.model.variance_loss(pred_latent, gamma=0.05)
 
         main_loss, loss_dict = self.model.compute_loss(
             pred_latent,
@@ -108,8 +180,13 @@ class Trainer:
             survival_time,
             event_indicator,
         )
-        total_loss = main_loss + self.contrastive_weight * contrastive_loss
+        total_loss = (main_loss
+                      + self.contrastive_weight * contrastive_loss
+                      + self.cf_weight * cf_loss
+                      + self.variance_weight * var_loss)
         loss_dict["contrastive"] = contrastive_loss.item()
+        loss_dict["cf"] = cf_loss.item()
+        loss_dict["var"] = var_loss.item()
         loss_dict["total"] = total_loss.item()
 
         return {
@@ -125,7 +202,7 @@ class Trainer:
 
     def train_epoch(self, epoch):
         self.model.train()
-        epoch_losses = {"total": [], "l1": [], "cox": [], "bce": [], "contrastive": []}
+        epoch_losses = {"total": [], "l1": [], "cox": [], "bce": [], "contrastive": [], "cf": [], "var": []}
         all_risks = []
         all_survival_times = []
         all_events = []
@@ -134,13 +211,26 @@ class Trainer:
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [Train]")
         for batch_idx, batch in enumerate(pbar):
-            outputs = self._shared_step(batch, compute_contrastive=False)
+            outputs = self._shared_step(
+                batch,
+                compute_contrastive=(self.contrastive_weight > 0 or self.cf_weight > 0),
+            )
 
             self.optimizer.zero_grad(set_to_none=True)
             outputs["total_loss"].backward()
             if self.grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip_norm)
             self.optimizer.step()
+
+            # EMA update: θ_ema = m·θ_ema + (1-m)·θ_online
+            if self.ema_mri_encoder is not None:
+                m = self.ema_momentum
+                with torch.no_grad():
+                    for p_ema, p_online in zip(
+                        self.ema_mri_encoder.parameters(),
+                        self.model.mri_encoder.parameters()
+                    ):
+                        p_ema.data.mul_(m).add_(p_online.data, alpha=1.0 - m)
 
             for key in epoch_losses:
                 epoch_losses[key].append(outputs["loss_dict"][key])
@@ -162,6 +252,7 @@ class Trainer:
                 pbar.set_postfix(
                     loss=f"{outputs['loss_dict']['total']:.4f}",
                     main=f"{outputs['main_loss'].item():.4f}",
+                    cf=f"{outputs['loss_dict']['cf']:.4f}",
                     contra=f"{outputs['loss_dict']['contrastive']:.4f}",
                 )
            
@@ -194,7 +285,7 @@ class Trainer:
     @torch.no_grad()
     def validate(self):
         self.model.eval()
-        epoch_losses = {"total": [], "l1": [], "cox": [], "bce": [], "contrastive": []}
+        epoch_losses = {"total": [], "l1": [], "cox": [], "bce": [], "contrastive": [], "cf": [], "var": []}
         all_risks = []
         all_survival_times = []
         all_events = []
@@ -220,29 +311,29 @@ class Trainer:
                 if inp and isinstance(inp[0], torch.Tensor):
                     _store(name, inp[0])
             return _h
+        sm = self.model.survival_module
         _hooks = [
             self.model.shared_text_encoder.final_proj.register_forward_hook(
                 _make_hook("text_final_proj_out")),
             self.model.latent_predictor.output_proj.register_forward_hook(
                 _make_hook("latent_delta")),
-            self.model.survival_module.input_proj.register_forward_hook(
+            sm.input_proj.register_forward_hook(
                 _make_hook("surv_input_proj")),
-            self.model.survival_module.two_way_attn.register_forward_hook(
+            sm.two_way_attn.register_forward_hook(
                 _make_hook("two_way_attn_seq1_out")),
-            # capture combined = [pre_mean, pred_mean, delta_mean] BEFORE fusion
-            self.model.survival_module.modality_fusion[0].register_forward_hook(
+            sm.modality_fusion[0].register_forward_hook(
                 _make_hook_in("combined_input")),
-            self.model.survival_module.modality_fusion[0].register_forward_hook(
+            sm.modality_fusion[0].register_forward_hook(
                 _make_hook("surv_fusion_fc1")),
-            self.model.survival_module.modality_fusion[4].register_forward_hook(
-                _make_hook("surv_fusion_fc2")),
-            self.model.survival_module.risk_head[0].register_forward_hook(
+            sm.modality_fusion[-1].register_forward_hook(
+                _make_hook("surv_fusion_last")),
+            sm.risk_head[0].register_forward_hook(
                 _make_hook("risk_head_fc1")),
-            self.model.survival_module.risk_head[-1].register_forward_hook(
+            sm.risk_head[-1].register_forward_hook(
                 _make_hook("risk_head_out")),
-            self.model.survival_module.survival_head[0].register_forward_hook(
+            sm.survival_head[0].register_forward_hook(
                 _make_hook("surv_head_fc1")),
-            self.model.survival_module.survival_head[-1].register_forward_hook(
+            sm.survival_head[-1].register_forward_hook(
                 _make_hook("surv_head_out")),
         ]
         _debug_done = False
@@ -258,7 +349,6 @@ class Trainer:
                 _debug_done = True
                 _pl = outputs["risk_score"].float()
                 _pre = batch["pre_latent"].float()
-                sm = self.model.survival_module
                 print(f"\n  [DEBUG-VAL first batch]  (batch_std=cross-sample, feat_std=within-sample)")
                 print(f"    {'layer':<30}  batch_std   feat_std    mean")
                 print(f"    {'pre_latent':<30}  {_pre.reshape(_pre.shape[0],-1).std(dim=0).mean():.4f}      {_pre.reshape(_pre.shape[0],-1).std(dim=1).mean():.4f}      {_pre.mean():.4f}")
@@ -338,13 +428,26 @@ class Trainer:
         if resume_from is not None:
             print(f"Loading checkpoint from {resume_from}...")
             checkpoint = torch.load(resume_from, map_location="cpu", weights_only=False)
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            # Support both full state_dict and trainable-only state_dict
+            if "trainable_state_dict" in checkpoint:
+                self.model.load_state_dict(checkpoint["trainable_state_dict"], strict=False)
+            else:
+                self.model.load_state_dict(checkpoint["model_state_dict"])
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            except (ValueError, KeyError) as e:
+                print(f"  [Resume] Skipping optimizer/scheduler state ({e}); "
+                      "starting fresh optimizer from loaded model weights.")
             start_epoch = checkpoint["epoch"] + 1
             self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
             self.best_c_index = checkpoint.get("best_c_index", 0.0)
-            self.history = checkpoint.get("history", self.history)
+            loaded_history = checkpoint.get("history", {})
+            # Merge: keep loaded values for existing keys, add missing keys from self.history
+            for k in self.history:
+                if k in loaded_history:
+                    self.history[k] = loaded_history[k]
+                # else: keep self.history[k] = [] (new keys start empty)
             print(f"Resumed from epoch {checkpoint['epoch']}")
             print(f"Best C-index so far: {self.best_c_index:.4f}")
 
@@ -355,22 +458,23 @@ class Trainer:
         print(f"Contrastive loss weight: {self.contrastive_weight}")
         print("-" * 80)
 
-        warmup_epochs = 20  # Phase 1: L1-only to train LatentPredictor
+        warmup_epochs = self.warmup_epochs
 
         for epoch in range(start_epoch, num_epochs + 1):
             # --- Phase switching ---
-            if epoch <= warmup_epochs:
+            if warmup_epochs > 0 and epoch <= warmup_epochs:
                 if epoch == start_epoch or epoch == 1:
                     print(f"[Phase 1] Epochs 1-{warmup_epochs}: L1-only warmup (λ=1,0,0)")
                 self.model.lambda_l1.fill_(1.0)
                 self.model.lambda_cox.fill_(0.0)
                 self.model.lambda_bce.fill_(0.0)
             else:
-                if epoch == warmup_epochs + 1:
-                    print(f"[Phase 2] Epoch {epoch}+: full survival training (λ=3,2,1)")
-                self.model.lambda_l1.fill_(3.0)
-                self.model.lambda_cox.fill_(2.0)
-                self.model.lambda_bce.fill_(1.0)
+                if epoch == (warmup_epochs + 1) or (warmup_epochs == 0 and epoch == start_epoch):
+                    print(f"[Phase 2] Epoch {epoch}+: survival training "
+                          f"(λ_l1={self.lam_l1}, λ_cox={self.lam_cox}, λ_bce={self.lam_bce})")
+                self.model.lambda_l1.fill_(self.lam_l1)
+                self.model.lambda_cox.fill_(self.lam_cox)
+                self.model.lambda_bce.fill_(self.lam_bce)
 
             train_losses, train_c_index, train_auc = self.train_epoch(epoch)
             val_losses, val_c_index, val_auc = self.validate()
@@ -383,13 +487,15 @@ class Trainer:
             self.history["train_auc"].append(train_auc)
             self.history["val_auc"].append(val_auc)
             self.history["train_contrastive_loss"].append(train_losses["contrastive"])
+            self.history["train_cf_loss"].append(train_losses["cf"])
 
             print(f"\nEpoch {epoch}/{num_epochs}")
             print(
                 "Train - Loss: "
                 f"{train_losses['total']:.4f} "
                 f"(L1: {train_losses['l1']:.4f}, Cox: {train_losses['cox']:.4f}, "
-                f"BCE: {train_losses['bce']:.4f}, Contra: {train_losses['contrastive']:.4f}), "
+                f"BCE: {train_losses['bce']:.4f}, Contra: {train_losses['contrastive']:.4f}, "
+                f"CF: {train_losses['cf']:.4f}), "
                 f"C-index: {train_c_index:.4f}, 1-year AUC: {train_auc:.4f}"
             )
             print(
@@ -416,6 +522,12 @@ class Trainer:
 
             print("-" * 80)
 
+            if epoch > warmup_epochs and self.early_stopper is not None:
+                if self.early_stopper.step(val_c_index):
+                    print(f"[EarlyStopping] No improvement for {self.early_stopper.patience} "
+                          f"epochs. Best Val C-index: {self.early_stopper.best:.4f}. Stopping.")
+                    break
+
         self.save_history()
         print("\nTraining completed!")
         print(f"Best C-index: {self.best_c_index:.4f}")
@@ -429,10 +541,26 @@ class Trainer:
 
     def save_checkpoint(self, epoch, filename):
         checkpoint_path = self.save_dir / filename
+        # Only save trainable parameters to keep checkpoint small (~100MB vs 4.6GB).
+        # Frozen MedGemma base weights are reloaded from HF cache at resume time.
+        trainable_state = {
+            k: v for k, v in self.model.state_dict().items()
+            if any(k.startswith(prefix) for prefix in [
+                "latent_predictor.", "survival_module.",
+                "shared_text_encoder.final_proj.",
+                "shared_text_encoder.model.base_model.model.",   # LoRA adapters via PEFT
+            ]) and self.model.state_dict()[k].requires_grad or
+            # always include non-frozen small modules
+            k.startswith("lambda_")
+        }
+        # Fallback: if filter too aggressive, save all trainable
+        trainable_keys = {n for n, p in self.model.named_parameters() if p.requires_grad}
+        trainable_state = {k: v for k, v in self.model.state_dict().items()
+                           if k in trainable_keys or k.startswith("lambda_")}
         torch.save(
             {
                 "epoch": epoch,
-                "model_state_dict": self.model.state_dict(),
+                "trainable_state_dict": trainable_state,
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "best_val_loss": self.best_val_loss,
@@ -441,13 +569,19 @@ class Trainer:
             },
             checkpoint_path,
         )
-        print(f"Checkpoint saved at {checkpoint_path}")
+        size_mb = checkpoint_path.stat().st_size / 1e6
+        print(f"Checkpoint saved at {checkpoint_path} ({size_mb:.0f} MB)")
 
 
 def build_dataloaders(args):
+    mri_data_dir = getattr(args, "mri_data_dir", None)
+    features_csv = getattr(args, "features_csv", None)
+    # In online mode (sam_ckpt set + mri_data_dir set), features_csv is optional
     data_cfg = Config(
         timeline_json=args.timeline_json,
-        features_csv=args.features_csv,
+        features_csv=features_csv,
+        take_dims=args.take_dims,
+        mri_data_dir=mri_data_dir,
     )
     full_dataset = GliomaAllPairsTextDataset(data_cfg, include_between=False)
 
@@ -487,7 +621,13 @@ def build_dataloaders(args):
             val_pids.add(last_pid)
 
     train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+    val_dataset   = torch.utils.data.Subset(full_dataset, val_indices)
+
+    # Overfit mode: use train set as val to verify C-index can memorise training data
+    overfit = getattr(args, "overfit", False)
+    if overfit:
+        print("[OVERFIT MODE] val = train set to verify C-index can memorise")
+        val_dataset = train_dataset
 
     print("Split complete:")
     print(
@@ -495,8 +635,8 @@ def build_dataloaders(args):
         f"({len(train_dataset) / len(full_dataset):.1%})"
     )
     print(
-        f"  Val:   {len(val_pids)} patients, {len(val_dataset)} samples "
-        f"({len(val_dataset) / len(full_dataset):.1%})"
+        f"  Val:   {'[=train]' if overfit else f'{len(val_pids)} patients'}, "
+        f"{len(val_dataset)} samples"
     )
 
     collate_fn = GliomaAllPairsTextDataset.collate_fn
@@ -521,28 +661,45 @@ def build_dataloaders(args):
 
 
 def build_model(args, device):
+    # Construct vision backbone externally so the core model stays backbone-agnostic.
+    # To use a different backbone, construct it here and pass it as vision_backbone.
+    vision_backbone = None
+    brainiac_ckpt = getattr(args, "brainiac_ckpt", None)
+    if brainiac_ckpt is not None:
+        from models.brainiac_adapter import BrainIACAdapter
+        from models.vision_backbone import MultiModalVisionBackbone
+        _adapter = BrainIACAdapter(
+            checkpoint_path=brainiac_ckpt,
+            tokens_per_modality=getattr(args, "brainiac_tokens", 8),
+            lora_r=getattr(args, "brainiac_lora_r", 8),
+        )
+        vision_backbone = MultiModalVisionBackbone(_adapter, num_modalities=4)
+
     model = TimeAwareGliomaSurvivalPredictor(
         text_encoder_name=args.text_encoder_name,
         freeze_text_encoder=args.freeze_text_encoder,
         text_output_dim=768,
         time_dim=128,
         time_encoding_type="fourier",
-        latent_dim=767,
-        num_modalities=4,
+        latent_dim=args.latent_dim,
+        num_modalities=args.num_modalities,
         predictor_hidden_dim=512,
         predictor_num_layers=4,
         predictor_num_heads=8,
         survival_hidden_dim=128,
-        lambda_l1=5.0,
-        lambda_cox=3.0,
-        lambda_bce=1.0,
-        dropout=0.3,
+        lambda_l1=args.lambda_l1,
+        lambda_cox=args.lambda_cox,
+        lambda_bce=args.lambda_bce,
+        dropout=args.dropout,
+        vision_backbone=vision_backbone,
     ).to(device)
 
     param_count = model.get_parameter_count()
     print("\nModel statistics:")
-    print(f"  Total parameters: {param_count['total']:,}")
+    print(f"  Total parameters:     {param_count['total']:,}")
     print(f"  Trainable parameters: {param_count['trainable']:,}")
+    if "mri_encoder_trainable" in param_count:
+        print(f"  MRI encoder LoRA:     {param_count['mri_encoder_trainable']:,}")
     return model
 
 
@@ -556,13 +713,15 @@ def build_optimizer(args, model):
                 {"params": params, "lr": lr, "weight_decay": weight_decay}
             )
 
-    add_group(model.latent_predictor.time_proj.parameters(), args.lr, 1e-4)
+    add_group(model.latent_predictor.time_proj.parameters(), args.lr, 5e-4)
     add_group(
         [p for n, p in model.latent_predictor.named_parameters() if "time_proj" not in n],
         args.lr * 0.1,
         1e-5,
     )
-    add_group(model.survival_module.parameters(), args.lr, 1e-5)
+    # Survival module: high weight_decay to fight small-dataset overfitting
+    survival_wd = getattr(args, "survival_wd", 1e-2)
+    add_group(model.survival_module.parameters(), args.lr, survival_wd)
 
     text_lora_params = []
     text_proj_params = []
@@ -580,6 +739,15 @@ def build_optimizer(args, model):
     add_group(text_proj_params, args.text_proj_lr, 1e-4)
     add_group(text_other_params, args.text_lr, 0.0)
 
+    # Vision encoder LoRA (only when sam_ckpt is set)
+    if model.mri_encoder is not None:
+        vision_lora_params = [
+            p for _, p in model.mri_encoder.named_parameters() if p.requires_grad
+        ]
+        if vision_lora_params:
+            add_group(vision_lora_params, args.vision_lr, 0.0)
+            print(f"  Vision LoRA param group: {sum(p.numel() for p in vision_lora_params):,} params @ lr={args.vision_lr}")
+
     if not optimizer_groups:
         raise ValueError("No trainable parameter groups were created.")
 
@@ -590,7 +758,8 @@ def build_optimizer(args, model):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp_name", type=str, default="mri_backbone_survival")
+    parser.add_argument("--exp_name", type=str, default="mri_backbone_survival",
+                        help="Experiment name. Checkpoints saved to experiments/<exp_name>/checkpoints/")
     parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_epochs", type=int, default=70)
@@ -602,8 +771,48 @@ def parse_args():
     parser.add_argument("--text_proj_lr", type=float, default=5e-4)
     parser.add_argument("--vision_lr", type=float, default=5e-5)
     parser.add_argument("--vision_full_lr", type=float, default=1e-5)
+    parser.add_argument("--brainiac_ckpt", type=str, default=None,
+                        help="Path to BrainIAC.ckpt for online fine-tuning (overrides sam_ckpt)")
+    parser.add_argument("--brainiac_tokens", type=int, default=8,
+                        help="Patch tokens per modality from BrainIAC (default 8, total M=32)")
+    parser.add_argument("--brainiac_lora_r", type=int, default=8,
+                        help="LoRA rank for BrainIAC backbone (0=frozen)")
+    parser.add_argument("--brainiac_ema_momentum", type=float, default=0.0,
+                        help="EMA momentum for BrainIAC target encoder (0=disabled, use stop-grad; "
+                             "0.996 recommended for BYOL/JEPA-style training)")
+    parser.add_argument("--sam_ckpt", type=str, default=None,
+                        help="SAM ViT-B checkpoint. Enables end-to-end MRI encoder LoRA (plan B).")
+    parser.add_argument("--mri_data_dir", type=str, default=None,
+                        help="Root dir of raw NIfTI MRI volumes (e.g. datasets/MU-Glioma-Post). "
+                             "Required when --sam_ckpt is set for online inference.")
+    parser.add_argument("--vision_lora_r", type=int, default=4)
+    parser.add_argument("--vision_lora_alpha", type=int, default=16)
+    parser.add_argument("--vision_lora_dropout", type=float, default=0.1)
+    parser.add_argument("--num_slices", type=int, default=32,
+                        help="Central axial slices per modality fed to SAM ViT (VRAM budget).")
     parser.add_argument("--contrastive_weight", type=float, default=0.0)
+    parser.add_argument("--contrastive_temperature", type=float, default=0.1)
+    parser.add_argument("--variance_weight", type=float, default=0.0,
+                        help="VICReg variance loss weight to prevent pred_latent collapse")
+    parser.add_argument("--cf_weight", type=float, default=0.0,
+                        help="Drug-swap counterfactual diversity loss weight "
+                             "(pushes pred_latent apart for different drugs)")
+    parser.add_argument("--cf_cos_margin", type=float, default=0.9,
+                        help="Cosine similarity margin for CF diversity loss "
+                             "(penalise cos_sim > margin for different-drug pairs)")
+    parser.add_argument("--early_stopping_patience", type=int, default=0,
+                        help="Early stopping patience (0=disabled)")
+    parser.add_argument("--survival_wd", type=float, default=1e-2,
+                        help="Weight decay for survival module (default 1e-2)")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
+    parser.add_argument("--warmup_epochs", type=int, default=10,
+                        help="L1-only warmup epochs before Cox+BCE activate (0=no warmup)")
+    parser.add_argument("--lambda_l1",  type=float, default=3.0)
+    parser.add_argument("--lambda_cox", type=float, default=2.0)
+    parser.add_argument("--lambda_bce", type=float, default=1.0)
+    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--overfit", action="store_true",
+                        help="Use train set as val to verify C-index can overfit")
     parser.add_argument(
         "--features_csv",
         type=str,
@@ -616,15 +825,26 @@ def parse_args():
     )
     parser.add_argument("--text_encoder_name", type=str, default=TEXT_ENCODER_NAME)
     parser.add_argument("--freeze_text_encoder", action="store_true")
+    # encoder-agnostic feature dims (767=BrainIAC, 256=mri_foundation SAM)
+    parser.add_argument("--latent_dim",    type=int, default=767,
+                        help="Feature dim per token from the visual encoder")
+    parser.add_argument("--take_dims",     type=int, default=767,
+                        help="Dims to take per modality from CSV (BrainIAC only)")
+    parser.add_argument("--num_modalities", type=int, default=4,
+                        help="Number of token slots: 4 for BrainIAC, 4*N_slices for mri_foundation")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    features_path = Path(args.features_csv)
-    if not features_path.exists():
-        raise FileNotFoundError(f"features_csv not found: {features_path}")
-    print(f"Using precomputed latent features from {features_path}")
+    # features_csv is optional when mri_data_dir+sam_ckpt is provided (online mode)
+    if args.features_csv:
+        features_path = Path(args.features_csv)
+        if not features_path.exists():
+            raise FileNotFoundError(f"features_csv not found: {features_path}")
+        print(f"Using precomputed latent features from {features_path}")
+    else:
+        print("Online MRI encoding mode (no pre-extracted features)")
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -636,7 +856,7 @@ def main():
     model = build_model(args, device)
     optimizer, scheduler = build_optimizer(args, model)
 
-    save_dir = Path("checkpoints") / args.exp_name
+    save_dir = Path("experiments") / args.exp_name / "checkpoints"
     save_dir.mkdir(parents=True, exist_ok=True)
     with open(save_dir / "args.json", "w", encoding="utf-8") as handle:
         json.dump(vars(args), handle, indent=2)
@@ -650,7 +870,17 @@ def main():
         device=device,
         save_dir=save_dir,
         contrastive_weight=args.contrastive_weight,
+        contrastive_temperature=args.contrastive_temperature,
+        variance_weight=args.variance_weight,
+        cf_weight=getattr(args, "cf_weight", 0.0),
+        cf_cos_margin=getattr(args, "cf_cos_margin", 0.9),
         grad_clip_norm=args.grad_clip_norm,
+        warmup_epochs=args.warmup_epochs,
+        lam_l1=args.lambda_l1,
+        lam_cox=args.lambda_cox,
+        lam_bce=args.lambda_bce,
+        early_stopping_patience=args.early_stopping_patience,
+        ema_momentum=getattr(args, "brainiac_ema_momentum", 0.0),
     )
 
     print(f"\n{'=' * 80}")

@@ -49,9 +49,12 @@ def partial_ll_loss(lrisks, tb, eb, eps=1e-3):
     
     # 只计算发生事件的样本
     pll = plls[eb == 1]
+    n_events = pll.shape[0]
+    if n_events == 0:
+        return lrisks.new_tensor(0.0)
     pll = torch.sum(pll)
-    
-    return -pll
+
+    return -pll / n_events
 
 
 class NLLDeepSurvLoss(nn.Module):

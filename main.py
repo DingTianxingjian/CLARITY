@@ -1,5 +1,7 @@
 # main.py
 # -*- coding: utf-8 -*-
+import copy
+import datetime
 import json
 import math
 import os
@@ -320,23 +322,35 @@ class SequenceWorldModel:
                 Path(meta_file).exists()
             )
 
-            # ====== 1️⃣ 创建模型（必须与训练时参数一致）======
+            # ====== 0️⃣ 从 args.json 读取训练时参数（保证与 checkpoint 完全一致）======
+            args_path = base_path.parent / "args.json"
+            saved_args: Dict[str, Any] = {}
+            if args_path.exists():
+                with open(args_path) as _f:
+                    saved_args = json.load(_f)
+                print(f"[WorldModel] Loaded model args from {args_path}")
+            else:
+                print(f"[WorldModel] Warning: args.json not found at {args_path}, using defaults")
+
+            # ====== 1️⃣ 创建模型（从 args.json 读取参数，ISE 推理不加载 BrainIAC）======
             model = TimeAwareGliomaSurvivalPredictor(
-                text_encoder_name="google/medgemma-4b-it",
+                text_encoder_name=saved_args.get("text_encoder_name", "google/medgemma-4b-it"),
                 freeze_text_encoder=False,
-                text_output_dim=768,
-                time_dim=128,
-                time_encoding_type='fourier',
-                latent_dim=767,
-                num_modalities=4,
+                text_output_dim=saved_args.get("text_output_dim", 768),
+                time_dim=saved_args.get("time_dim", 128),
+                time_encoding_type=saved_args.get("time_encoding_type", "fourier"),
+                latent_dim=saved_args.get("latent_dim", 768),
+                num_modalities=saved_args.get("num_modalities", 32),
                 predictor_hidden_dim=512,
-                predictor_num_layers=4,
-                predictor_num_heads=8,
+                predictor_num_layers=saved_args.get("predictor_num_layers", 4),
+                predictor_num_heads=saved_args.get("predictor_num_heads", 8),
                 survival_hidden_dim=128,
-                lambda_l1=5.0,
-                lambda_cox=1,
-                lambda_bce=1,
-                dropout=0.2
+                lambda_l1=saved_args.get("lambda_l1", 5.0),
+                lambda_cox=saved_args.get("lambda_cox", 1.0),
+                lambda_bce=saved_args.get("lambda_bce", 1.0),
+                dropout=saved_args.get("dropout", 0.2),
+                # ISE 推理时传入预计算 latent，不需要加载 BrainIAC online encoder
+                brainiac_ckpt=None,
             )
 
             # ====== 2️⃣ 若是 LoRA 混合模型，执行加载逻辑 ======
@@ -402,8 +416,15 @@ class SequenceWorldModel:
             else:
                 print(f"[WorldModel] Loading regular checkpoint")
                 ckpt = torch.load(model_path, map_location=self.device, weights_only=False)
-                model.load_state_dict(ckpt['model_state_dict'])
-                print(f"  ✓ Successfully loaded checkpoint")
+                # 优先使用 trainable_state_dict（exp011/exp012 保存格式），回退到 model_state_dict
+                state_key = "trainable_state_dict" if "trainable_state_dict" in ckpt else "model_state_dict"
+                missing, unexpected = model.load_state_dict(ckpt[state_key], strict=False)
+                if missing:
+                    print(f"  [Resume] Missing keys ({len(missing)}): {missing[:5]}{'...' if len(missing)>5 else ''}")
+                if unexpected:
+                    print(f"  [Resume] Unexpected keys ({len(unexpected)}): {unexpected[:5]}{'...' if len(unexpected)>5 else ''}")
+                epoch_info = f"epoch={ckpt.get('epoch', '?')}  best_c_index={ckpt.get('best_c_index', float('nan')):.4f}"
+                print(f"  ✓ Successfully loaded checkpoint ({epoch_info})")
 
             return model
 
@@ -443,14 +464,13 @@ class SequenceWorldModel:
             td = torch.tensor([float(time_delta_days)], device=self.device, dtype=torch.float)
 
             for _ in range(num_samples):
-                pred_latent, risk, surv_logit = self.model(
+                pred_latent, risk, surv_logit, _ = self.model(
                     pre_latent=pre_latent,
                     drugs_text=[sequence_json],
                     time_delta=td,
                     clinical_text=[clinical_text]
                 )
                 risk_scores.append(float(risk))
-                # 注意：若你的head输出不是logit，请相应修改
                 surv_probs.append(torch.sigmoid(surv_logit).item())
 
         return {
@@ -506,7 +526,7 @@ class SequenceWorldModel:
                 sample_next_latents: List[torch.Tensor] = []
 
                 for _ in range(num_samples):
-                    pred_latent, risk, surv_logit = self.model(
+                    pred_latent, risk, surv_logit, _ = self.model(
                         pre_latent=current_latent,
                         drugs_text=[sequence_json],
                         time_delta=td,
@@ -543,11 +563,12 @@ class SequenceWorldModel:
 # 评分器：接入 Policy/toxicity_rules.py，简单复杂度项 & 不确定性惩罚
 # ============================================================================ 
 class SequenceScorer:
-    def __init__(self, w_risk=1.0, w_tox=0.2, w_comp=0.1, w_unc=0.15):
+    def __init__(self, w_risk=1.0, w_tox=0.2, w_comp=0.1, w_unc=0.15, w_surv=0.0):
         self.w_risk = w_risk
         self.w_tox = w_tox
         self.w_comp = w_comp
         self.w_unc = w_unc
+        self.w_surv = w_surv
 
     def score(
         self,
@@ -567,6 +588,7 @@ class SequenceScorer:
             + self.w_tox * tox
             + self.w_comp * comp
             + self.w_unc * unc
+            - self.w_surv * surv   # higher survival prob → lower score (better)
             - entropy_temperature * entropy_bonus
         )
 
@@ -703,6 +725,9 @@ class SequenceExplorer:
         for i, s in enumerate(llm_sequences, 1):
             fixed = self.guard.repair(s)
             errs = self.guard.validate_sequence(fixed)
+            if errs:
+                print(f"  [Guardrails] Seed {i} dropped after repair: {errs}")
+                continue
             seeds.append(fixed)
 
         # ----------------------------------------------------------------------
@@ -714,6 +739,7 @@ class SequenceExplorer:
             - 药物类别不重复（每种 kind 仅保留一个）
             - 总数量等于 target_drug_num
             """
+            sequence = copy.deepcopy(sequence)  # 避免就地修改影响原始 seed / variant
             allowed_kinds = ("chemotherapy", "immunotherapy", "additional_1", "additional_2", "other_therapy")
 
             # 1. 去除重复类别（保留每类第一个）
@@ -1050,7 +1076,7 @@ if __name__ == "__main__":
     API_KEY = os.environ.get("OPENAI_API_KEY")
     if not API_KEY:
         raise RuntimeError("OPENAI_API_KEY is required to run main.py")
-    WORLD_MODEL_PATH = "./Predictor/checkpoints/context/best_c_index.pth"
+    WORLD_MODEL_PATH = "experiments/exp012_cf_diversity/checkpoints/best_c_index.pth"
     DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
     context_static = {
@@ -1155,11 +1181,12 @@ if __name__ == "__main__":
     # ======================================================================== 
     # 实际使用时应该从你的影像数据通过encoder得到
     # 这里用随机tensor模拟
-    pre_latent = torch.randn(1, 4, 767).to(DEVICE)
-    
+    # BrainIAC online encoder: 4 modalities × 8 tokens × 768 dims → [1, 32, 768]
+    # 真实场景请从 mri_encoder(pre_mri) 获取，此处用随机 tensor 演示接口
+    pre_latent = torch.randn(1, 32, 768).to(DEVICE)
+
     # 如果你有真实的影像特征提取器：
-    # from your_image_encoder import extract_latent
-    # pre_latent = extract_latent(mri_data).to(DEVICE)  # [1, 4, 767]
+    # pre_latent = model.mri_encoder(pre_mri).to(DEVICE)  # [1, 32, 768]
 
     # ======================================================================== 
     # 5. 执行治疗序列探索
@@ -1232,7 +1259,7 @@ if __name__ == "__main__":
             for i, seq in enumerate(results["top_sequences"][:10])
         ],
         "metadata": {
-            "timestamp": str(torch.cuda.Event(enable_timing=False)),
+            "timestamp": datetime.datetime.now().isoformat(),
             "device": DEVICE,
             "model_path": WORLD_MODEL_PATH,
             "genomic_profile": clinical.genomics.to_dict(),
