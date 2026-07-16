@@ -816,7 +816,9 @@ def parse_args():
     parser.add_argument(
         "--features_csv",
         type=str,
-        default="./Predictor/dataset/MU_Glioma_Post/features_output.csv",
+        default=None,
+        help="Pre-extracted BrainIAC features CSV (optional in online mode). "
+             "If omitted, all patients in --timeline_json with MRI files are used.",
     )
     parser.add_argument(
         "--timeline_json",

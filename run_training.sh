@@ -1,12 +1,16 @@
 #!/bin/bash
 # CLARITY/run_training.sh — train exp012 (BrainIAC online encoder)
 #
-# Before running, place the following external files alongside this repo:
+# Required files (place alongside this repo):
 #
 #   BrainIAC-main/src/checkpoints/BrainIAC.ckpt        ← BrainIAC ViT-B weights
-#   Predictor/dataset/MU_Glioma_Post/features_output.csv   ← pre-extracted features
-#   Predictor/dataset/MU_Glioma_Post/clinical_latest.json  ← clinical timeline
-#   datasets/MU-Glioma-Post/                               ← raw MRI NIfTI files
+#   Predictor/dataset/MU_Glioma_Post/clinical_latest.json  ← clinical timeline (required)
+#   datasets/MU-Glioma-Post/                               ← raw MRI NIfTI files (required)
+#
+# Optional:
+#   Predictor/dataset/MU_Glioma_Post/features_output.csv   ← pre-extracted BrainIAC features
+#     If present, used as a data-availability filter (only patients in the CSV are trained on).
+#     If absent, all patients in clinical_latest.json with MRI files are used.
 #
 # Usage:
 #   cd CLARITY && bash run_training.sh
@@ -40,7 +44,7 @@ echo "  exp_name : $EXP_NAME"
 echo "  resume   : ${RESUME_FROM:-<scratch>}"
 echo "=========================================="
 
-for path in "$BRAINIAC_CKPT" "$FEATURES_CSV" "$TIMELINE_JSON" "$MRI_DATA_DIR"; do
+for path in "$BRAINIAC_CKPT" "$TIMELINE_JSON" "$MRI_DATA_DIR"; do
   if [ ! -e "$path" ]; then
     echo ""
     echo "ERROR: required path not found: $path"
@@ -48,6 +52,15 @@ for path in "$BRAINIAC_CKPT" "$FEATURES_CSV" "$TIMELINE_JSON" "$MRI_DATA_DIR"; d
     exit 1
   fi
 done
+
+# features_csv is optional: pass it only if the file exists
+FEATURES_CSV_ARG=""
+if [ -f "$FEATURES_CSV" ]; then
+  FEATURES_CSV_ARG="--features_csv $FEATURES_CSV"
+  echo "features_csv : $FEATURES_CSV (found)"
+else
+  echo "features_csv : not found — using all patients from clinical_latest.json"
+fi
 echo "Data paths OK."
 echo ""
 
@@ -58,7 +71,7 @@ RESUME_ARG=""
 
 $PYTHON Predictor/train.py \
   --exp_name          "$EXP_NAME" \
-  --features_csv      "$FEATURES_CSV" \
+  $FEATURES_CSV_ARG \
   --timeline_json     "$TIMELINE_JSON" \
   --mri_data_dir      "$MRI_DATA_DIR" \
   --brainiac_ckpt     "$BRAINIAC_CKPT" \

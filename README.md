@@ -29,12 +29,19 @@ pip install -r requirements.txt
 The following external files are required but not distributed in this repository.
 Place them at the paths shown (relative to the CLARITY root):
 
+**Required:**
 ```
-BrainIAC-main/src/checkpoints/BrainIAC.ckpt        # BrainIAC ViT-B weights
-Predictor/dataset/MU_Glioma_Post/features_output.csv  # pre-extracted BrainIAC features
-Predictor/dataset/MU_Glioma_Post/clinical_latest.json # clinical timeline (JSON)
-datasets/MU-Glioma-Post/                              # raw MRI NIfTI files (from TCIA)
+BrainIAC-main/src/checkpoints/BrainIAC.ckpt           # BrainIAC ViT-B weights
+Predictor/dataset/MU_Glioma_Post/clinical_latest.json  # clinical timeline (JSON)
+datasets/MU-Glioma-Post/                               # raw MRI NIfTI files (from TCIA)
 ```
+
+**Optional:**
+```
+Predictor/dataset/MU_Glioma_Post/features_output.csv   # pre-extracted BrainIAC features
+```
+If present, acts as a data-availability filter (only patients listed in the CSV are trained on).
+If absent, all patients in `clinical_latest.json` with corresponding MRI files are used.
 
 Raw MRI data (MU-Glioma-Post) can be requested from [TCIA](https://www.cancerimagingarchive.net/).
 
