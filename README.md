@@ -6,7 +6,7 @@ CLARITY is the official code release for our paper:
 > Tianxingjian Ding, Yuanhao Zou, Chen Chen, Mubarak Shah, Yu Tian
 > arXiv:2512.08029 (2025)
 > ### Official code release for our paper:
-**Accepted at ECCV 2025** 🎉
+![ECCV 2025](https://img.shields.io/badge/ECCV-2025-blue?style=for-the-badge)
 
 The repository includes:
 
