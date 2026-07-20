@@ -1,12 +1,22 @@
 # CLARITY
 
+<p align="center">
+  <a href="https://arxiv.org/abs/2512.08029"><img src="https://img.shields.io/badge/arXiv-2512.08029-b31b1b.svg" alt="arXiv"></a>
+  <img src="https://img.shields.io/badge/ECCV-2025-blue.svg?style=flat" alt="ECCV 2025">
+  <img src="https://img.shields.io/badge/Python-3.10-blue.svg" alt="Python">
+  <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
+</p>
+
 CLARITY is the official code release for our paper:
 
 > **CLARITY: Medical World Model for Guiding Treatment Decisions by Modeling Context-Aware Disease Trajectories in Latent Space**
 > Tianxingjian Ding, Yuanhao Zou, Chen Chen, Mubarak Shah, Yu Tian
-> arXiv:2512.08029 (2025)
-> ### Official code release for our paper:
-![ECCV 2025](https://img.shields.io/badge/ECCV-2025-blue?style=for-the-badge)
+> **ECCV 2025** · [arXiv:2512.08029](https://arxiv.org/abs/2512.08029)
+
+## 🎉 News
+- **[2026.07]** CLARITY has been accepted at **ECCV 2025**!
+
+---
 
 The repository includes:
 
