@@ -11,7 +11,7 @@ CLARITY is the official code release for our paper:
 
 > **CLARITY: Medical World Model for Guiding Treatment Decisions by Modeling Context-Aware Disease Trajectories in Latent Space**
 > Tianxingjian Ding, Yuanhao Zou, Chen Chen, Mubarak Shah, Yu Tian
-> **ECCV 2025** · [arXiv:2512.08029](https://arxiv.org/abs/2512.08029)
+> **ECCV 2026** · [arXiv:2512.08029](https://arxiv.org/abs/2512.08029)
 
 ## 🎉 News
 - **[2026.07]** CLARITY has been accepted at **ECCV 2026**!
