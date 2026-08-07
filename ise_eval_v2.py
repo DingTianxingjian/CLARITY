@@ -286,15 +286,25 @@ print("=" * 70)
 print("Loading exp012 model ...")
 args = json.load(open(ARGS_JSON))
 
+_brainiac_ckpt = args.get("brainiac_ckpt")
+_vision_backbone = None
+if _brainiac_ckpt:
+    from models.brainiac_adapter import BrainIACAdapter
+    from models.vision_backbone import MultiModalVisionBackbone
+    _adapter = BrainIACAdapter(
+        checkpoint_path=_brainiac_ckpt,
+        tokens_per_modality=args.get("brainiac_tokens", 8),
+        lora_r=args.get("brainiac_lora_r", 8),
+    )
+    _vision_backbone = MultiModalVisionBackbone(_adapter, num_modalities=4)
+
 model = TimeAwareGliomaSurvivalPredictor(
     text_encoder_name=args["text_encoder_name"],
     latent_dim=args["latent_dim"],
     num_modalities=args["num_modalities"],
     predictor_hidden_dim=512,
     survival_hidden_dim=128,
-    brainiac_ckpt=args.get("brainiac_ckpt"),
-    brainiac_tokens_per_modality=args.get("brainiac_tokens", 8),
-    brainiac_lora_r=args.get("brainiac_lora_r", 8),
+    vision_backbone=_vision_backbone,
 ).to(DEVICE)
 
 ckpt = torch.load(CKPT, map_location=DEVICE, weights_only=False)

@@ -115,15 +115,16 @@ class Trainer:
         }
 
     def _shared_step(self, batch, compute_contrastive: bool):
-        pre_latent = batch["pre_latent"].to(self.device, non_blocking=True)
-        post_latent = batch["post_latent"].to(self.device, non_blocking=True)
+        # pre_latent may be absent when features_csv is not provided (online-only mode)
+        pre_latent  = batch["pre_latent"].to(self.device, non_blocking=True)  if "pre_latent"  in batch else None
+        post_latent = batch["post_latent"].to(self.device, non_blocking=True) if "post_latent" in batch else None
         survival_time = batch["survival_time"].to(self.device, non_blocking=True)
         event_indicator = batch["event_indicator"].to(self.device, non_blocking=True)
         time_delta = batch["time_delta"].to(self.device, non_blocking=True)
         drugs_text = batch["drugs_text"]
         clinical_text = batch["clinical_text"]
 
-        # Online MRI encoding: bypass frozen NPZ, run ViT+LoRA end-to-end
+        # Online MRI encoding: bypass frozen CSV features, run ViT+LoRA end-to-end
         if self.model.mri_encoder is not None and "pre_mri" in batch:
             pre_mri  = batch["pre_mri"].to(self.device, non_blocking=True)
             post_mri = batch["post_mri"].to(self.device, non_blocking=True)
@@ -348,10 +349,11 @@ class Trainer:
                 _hooks.clear()
                 _debug_done = True
                 _pl = outputs["risk_score"].float()
-                _pre = batch["pre_latent"].float()
                 print(f"\n  [DEBUG-VAL first batch]  (batch_std=cross-sample, feat_std=within-sample)")
                 print(f"    {'layer':<30}  batch_std   feat_std    mean")
-                print(f"    {'pre_latent':<30}  {_pre.reshape(_pre.shape[0],-1).std(dim=0).mean():.4f}      {_pre.reshape(_pre.shape[0],-1).std(dim=1).mean():.4f}      {_pre.mean():.4f}")
+                if "pre_latent" in batch:
+                    _pre = batch["pre_latent"].float()
+                    print(f"    {'pre_latent':<30}  {_pre.reshape(_pre.shape[0],-1).std(dim=0).mean():.4f}      {_pre.reshape(_pre.shape[0],-1).std(dim=1).mean():.4f}      {_pre.mean():.4f}")
                 for name, (bstd, fstd, mean) in sorted(_debug.items()):
                     print(f"    {name:<30}  {bstd:.4f}      {fstd:.4f}      {mean:.4f}")
                 print(f"    risk_score (batch):             std={_pl.std():.6f}  mean={_pl.mean():.4f}")
