@@ -61,37 +61,23 @@ Raw MRI data (MU-Glioma-Post) can be requested from [TCIA](https://www.cancerima
 
 ## Training
 
-Use the provided script to train exp012 (BrainIAC online encoder + MedGemma):
+Use the provided script to reproduce the released model. Training runs in two stages
+(both with an EMA target encoder for BrainIAC, momentum 0.996):
+
+1. **Stage 1** (`exp011_cond_in_survival`): 60 epochs, 3-epoch L1-only warmup, no counterfactual loss.
+2. **Stage 2** (`exp012_cf_diversity`): resumes from the stage-1 `best_c_index.pth` and adds the
+   counterfactual diversity loss (`cf_weight=1.0`, `cf_cos_margin=0.9`), continuing to epoch 100.
 
 ```bash
 cd CLARITY
-bash run_training.sh
+huggingface-cli login          # MedGemma is a gated model
+bash run_training.sh           # stage 1 then stage 2
+bash run_training.sh --stage 2 # stage 2 only (requires the stage-1 checkpoint)
 ```
 
-To resume from a checkpoint:
-
-```bash
-bash run_training.sh --resume path/to/checkpoint.pth
-```
-
-Or run the training script directly with custom arguments:
-
-```bash
-export PYTHONPATH=Predictor:.
-python Predictor/train.py \
-  --exp_name          exp012_cf_diversity \
-  --features_csv      Predictor/dataset/MU_Glioma_Post/features_output.csv \
-  --timeline_json     Predictor/dataset/MU_Glioma_Post/clinical_latest.json \
-  --mri_data_dir      datasets/MU-Glioma-Post \
-  --brainiac_ckpt     BrainIAC-main/src/checkpoints/BrainIAC.ckpt \
-  --brainiac_tokens   8 \
-  --brainiac_lora_r   8 \
-  --latent_dim        768 \
-  --num_modalities    32 \
-  --text_encoder_name google/medgemma-4b-it \
-  --num_epochs        100 \
-  --batch_size        16
-```
+Checkpoints are written to `experiments/<exp_name>/checkpoints/`. The train/val split is
+patient-level (80/20, `--seed 42`) and deterministic; the validation patient IDs are printed at startup.
+See `run_training.sh` for the full list of hyperparameters.
 
 The model trains:
 

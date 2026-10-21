@@ -599,6 +599,7 @@ def build_dataloaders(args):
     target_train_size = int(0.8 * len(full_dataset))
     train_indices, val_indices = [], []
     train_pids, val_pids = set(), set()
+    train_pid_order = []
     current_train_size = 0
 
     for pid in unique_pids:
@@ -606,13 +607,16 @@ def build_dataloaders(args):
         if current_train_size < target_train_size:
             train_indices.extend(sample_indices)
             train_pids.add(pid)
+            train_pid_order.append(pid)
             current_train_size += len(sample_indices)
         else:
             val_indices.extend(sample_indices)
             val_pids.add(pid)
 
     if train_pids:
-        last_pid = next(iter(train_pids))
+        # Use the last patient added (not next(iter(set)), whose order depends on
+        # PYTHONHASHSEED and made the split differ between runs).
+        last_pid = train_pid_order[-1]
         indices_to_move = patient_to_indices[last_pid]
         err_before = abs(current_train_size - target_train_size)
         err_after = abs(current_train_size - len(indices_to_move) - target_train_size)
@@ -640,6 +644,7 @@ def build_dataloaders(args):
         f"  Val:   {'[=train]' if overfit else f'{len(val_pids)} patients'}, "
         f"{len(val_dataset)} samples"
     )
+    print(f"  Val PIDs: {sorted(val_pids)}")
 
     collate_fn = GliomaAllPairsTextDataset.collate_fn
     pin_memory = torch.cuda.is_available()
